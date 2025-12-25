@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
+    <title>Простой чат для двоих</title>
+    <link rel="stylesheet" href="style.css" />
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"
+    />
+  </head>
+  <body>
+    <!-- Экран входа -->
+    <div id="login-screen" class="screen active">
+      <div class="login-container">
+        <div class="app-icon">
+          <i class="fas fa-comments"></i>
+        </div>
+        <h1>Простой чат</h1>
+        <p>Введите ваше имя для входа в чат</p>
+
+        <div class="input-group">
+          <i class="fas fa-user"></i>
+          <input
+            type="text"
+            id="username"
+            placeholder="Ваше имя"
+            maxlength="20"
+            autocomplete="off"
+          />
+        </div>
+
+        <button id="login-btn" class="btn-primary">
+          <i class="fas fa-sign-in-alt"></i> Войти в чат
+        </button>
+
+        <div class="hint">
+          <i class="fas fa-info-circle"></i>
+          Можно открыть в двух вкладках с разными именами
+        </div>
+      </div>
+    </div>
+
+    <!-- Экран чата -->
+    <div id="chat-screen" class="screen">
+      <!-- Шапка чата -->
+      <header class="chat-header">
+        <div class="header-content">
+          <button id="back-btn" class="icon-btn">
+            <i class="fas fa-chevron-left"></i>
+          </button>
+          <div class="chat-info">
+            <h2><i class="fas fa-comments"></i> Общий чат</h2>
+            <p class="user-count">
+              Участников: <span id="online-count">1</span>
+            </p>
+          </div>
+          <button id="clear-btn" class="icon-btn">
+            <i class="fas fa-trash-alt"></i>
+          </button>
+        </div>
+      </header>
+
+      <!-- Контейнер сообщений -->
+      <main class="messages-container" id="messages-container">
+        <!-- Сообщения будут добавляться здесь -->
+        <div class="empty-state" id="empty-state">
+          <i class="fas fa-comment-slash"></i>
+          <p>Нет сообщений</p>
+          <p class="subtext">Начните общение первым!</p>
+        </div>
+      </main>
+
+      <!-- Панель ввода -->
+      <footer class="input-area">
+        <div class="input-wrapper">
+          <input
+            type="text"
+            id="message-input"
+            placeholder="Введите сообщение..."
+            maxlength="500"
+            autocomplete="off"
+          />
+          <button id="send-btn" class="send-btn" disabled>
+            <i class="fas fa-paper-plane"></i>
+          </button>
+        </div>
+        <div class="hint">
+          <i class="fas fa-wifi"></i>
+          <span id="connection-status">Подключение...</span>
+        </div>
+      </footer>
+    </div>
+
+    <!-- Уведомления -->
+    <div id="notification" class="notification"></div>
+
+    <script src="client.js"></script>
+  </body>
+</html>
