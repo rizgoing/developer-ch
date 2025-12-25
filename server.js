@@ -3,253 +3,216 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 
-// Конфигурация
 const PORT = process.env.PORT || 3000;
-const HISTORY_FILE = path.join(__dirname, "chat_history.json");
-const MAX_HISTORY = 100;
+const PUBLIC_DIR = path.join(__dirname, "public");
 
-// Хранилище данных
-let chatHistory = [];
-let connectedUsers = new Map();
+// Убедимся, что папка public существует
+if (!fs.existsSync(PUBLIC_DIR)) {
+  console.log("⚠️ Папка public не найдена, создаю...");
+  fs.mkdirSync(PUBLIC_DIR, { recursive: true });
 
-// Загружаем историю из файла
-function loadHistory() {
-  try {
-    if (fs.existsSync(HISTORY_FILE)) {
-      const data = fs.readFileSync(HISTORY_FILE, "utf8");
-      chatHistory = JSON.parse(data);
-      console.log(`Загружено ${chatHistory.length} сообщений из истории`);
-    }
-  } catch (error) {
-    console.error("Ошибка загрузки истории:", error);
-    chatHistory = [];
-  }
+  // Создаем базовый index.html если его нет
+  const basicHTML = `<!DOCTYPE html>
+<html>
+<head>
+    <title>Chat Loading...</title>
+    <style>body { font-family: Arial; padding: 50px; text-align: center; }</style>
+</head>
+<body>
+    <h1>Chat is loading...</h1>
+    <p>If you see this, static files are being served.</p>
+</body>
+</html>`;
+
+  fs.writeFileSync(path.join(PUBLIC_DIR, "index.html"), basicHTML);
 }
 
-// Сохраняем историю в файл
-function saveHistory() {
-  try {
-    fs.writeFileSync(HISTORY_FILE, JSON.stringify(chatHistory, null, 2));
-  } catch (error) {
-    console.error("Ошибка сохранения истории:", error);
-  }
-}
-
-// Добавляем сообщение в историю
-function addToHistory(message) {
-  chatHistory.push(message);
-
-  if (chatHistory.length > MAX_HISTORY) {
-    chatHistory = chatHistory.slice(-MAX_HISTORY);
-  }
-
-  saveHistory();
-}
-
-// Создаем HTTP сервер
 const server = http.createServer((req, res) => {
-  const ext = path.extname(req.url);
-  let contentType = "text/html";
-  let filePath = "";
+  console.log(`📥 ${req.method} ${req.url}`);
 
-  if (req.url === "/" || req.url === "/index.html") {
-    filePath = path.join(__dirname, "index.html");
-    contentType = "text/html";
-  } else if (req.url === "/style.css") {
-    filePath = path.join(__dirname, "style.css");
-    contentType = "text/css";
-  } else if (req.url === "/client.js") {
-    filePath = path.join(__dirname, "client.js");
-    contentType = "application/javascript";
-  } else {
-    res.writeHead(404);
-    res.end("Not Found");
+  // Игнорируем favicon.ico если нет файла
+  if (req.url === "/favicon.ico") {
+    res.writeHead(204);
+    res.end();
     return;
   }
 
-  fs.readFile(filePath, (err, content) => {
+  // Определяем путь к файлу
+  let filePath = req.url === "/" ? "/index.html" : req.url;
+  const fullPath = path.join(PUBLIC_DIR, filePath);
+
+  // Проверяем, существует ли файл
+  fs.readFile(fullPath, (err, content) => {
     if (err) {
-      res.writeHead(500);
-      res.end("Server Error");
-    } else {
-      res.writeHead(200, { "Content-Type": contentType });
-      res.end(content);
+      // Если файл не найден, показываем index.html (для SPA)
+      if (err.code === "ENOENT") {
+        fs.readFile(path.join(PUBLIC_DIR, "index.html"), (err, data) => {
+          if (err) {
+            res.writeHead(500, { "Content-Type": "text/plain" });
+            res.end("Server Error: Cannot load index.html");
+          } else {
+            res.writeHead(200, { "Content-Type": "text/html" });
+            res.end(data);
+          }
+        });
+      } else {
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end(`Server Error: ${err.code}`);
+      }
+      return;
     }
+
+    // Определяем Content-Type
+    const ext = path.extname(fullPath);
+    let contentType = "text/html";
+
+    switch (ext) {
+      case ".js":
+        contentType = "application/javascript";
+        break;
+      case ".css":
+        contentType = "text/css";
+        break;
+      case ".json":
+        contentType = "application/json";
+        break;
+      case ".png":
+        contentType = "image/png";
+        break;
+      case ".jpg":
+      case ".jpeg":
+        contentType = "image/jpeg";
+        break;
+      case ".ico":
+        contentType = "image/x-icon";
+        break;
+    }
+
+    res.writeHead(200, { "Content-Type": contentType });
+    res.end(content);
   });
 });
 
-// Создаем WebSocket сервер
+// WebSocket сервер
 const wss = new WebSocket.Server({ server });
 
-// Обработка подключений WebSocket
-wss.on("connection", (ws, req) => {
-  console.log("Новое подключение");
+let users = [];
 
-  // Отправляем историю чата новому пользователю
-  ws.send(
-    JSON.stringify({
-      type: "history",
-      messages: chatHistory,
-    })
-  );
+wss.on("connection", (ws) => {
+  console.log("🔗 Новое WebSocket подключение");
 
-  // Обработка сообщений от клиента
   ws.on("message", (data) => {
     try {
       const message = JSON.parse(data);
-      handleClientMessage(ws, message);
-    } catch (error) {
-      console.error("Ошибка парсинга сообщения:", error);
-      ws.send(
-        JSON.stringify({
-          type: "error",
-          message: "Неверный формат сообщения",
-        })
-      );
-    }
-  });
 
-  // Обработка отключения
-  ws.on("close", () => {
-    const user = connectedUsers.get(ws);
-    if (user) {
-      console.log(`${user.username} отключился`);
-      connectedUsers.delete(ws);
+      if (message.type === "join") {
+        // Проверяем, нет ли уже пользователя с таким именем
+        const existingUser = users.find((u) => u.username === message.username);
+        if (existingUser) {
+          ws.send(
+            JSON.stringify({
+              type: "error",
+              message: "Пользователь с таким именем уже в чате",
+            })
+          );
+          ws.close();
+          return;
+        }
 
-      broadcast(
-        {
-          type: "user_left",
+        // Добавляем пользователя
+        const user = { ws, username: message.username };
+        users.push(user);
+
+        console.log(`👤 ${message.username} присоединился`);
+
+        // Отправляем историю (пустую для простоты)
+        ws.send(
+          JSON.stringify({
+            type: "history",
+            messages: [],
+          })
+        );
+
+        // Уведомляем всех о новом пользователе
+        broadcast(
+          {
+            type: "user_joined",
+            username: message.username,
+            onlineCount: users.length,
+          },
+          ws
+        );
+      }
+
+      if (message.type === "message") {
+        const user = users.find((u) => u.ws === ws);
+        if (!user) return;
+
+        const chatMessage = {
+          type: "message",
+          id: Date.now(),
+          text: message.text.substring(0, 500),
           username: user.username,
-          onlineCount: connectedUsers.size,
-        },
-        ws
-      );
+          timestamp: Date.now(),
+        };
 
-      broadcastOnlineCount();
+        console.log(
+          `💬 ${user.username}: ${chatMessage.text.substring(0, 50)}`
+        );
+
+        // Отправляем всем
+        broadcast(chatMessage);
+      }
+    } catch (error) {
+      console.error("❌ Ошибка обработки сообщения:", error);
     }
   });
 
-  // Обработка ошибок
+  ws.on("close", () => {
+    const userIndex = users.findIndex((u) => u.ws === ws);
+    if (userIndex !== -1) {
+      const username = users[userIndex].username;
+      users.splice(userIndex, 1);
+      console.log(`👋 ${username} отключился`);
+
+      broadcast({
+        type: "user_left",
+        username: username,
+        onlineCount: users.length,
+      });
+    }
+  });
+
   ws.on("error", (error) => {
-    console.error("WebSocket ошибка:", error);
+    console.error("❌ WebSocket ошибка:", error);
   });
 });
 
-// Обработка сообщений от клиентов
-function handleClientMessage(ws, message) {
-  switch (message.type) {
-    case "join":
-      const existingUser = Array.from(connectedUsers.values()).find(
-        (u) => u.username === message.username
-      );
-
-      if (existingUser) {
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            message: "Пользователь с таким именем уже в чате",
-          })
-        );
-        ws.close();
-        return;
-      }
-
-      connectedUsers.set(ws, {
-        username: message.username,
-        joinTime: Date.now(),
-      });
-
-      console.log(`${message.username} присоединился к чату`);
-
-      broadcast(
-        {
-          type: "user_joined",
-          username: message.username,
-          onlineCount: connectedUsers.size,
-        },
-        ws
-      );
-
-      broadcastOnlineCount();
-      break;
-
-    case "message":
-      const user = connectedUsers.get(ws);
-      if (!user) {
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            message: "Сначала представьтесь",
-          })
-        );
-        return;
-      }
-
-      if (!message.text || message.text.trim().length === 0) {
-        return;
-      }
-
-      const chatMessage = {
-        id:
-          message.id ||
-          Date.now() + "-" + Math.random().toString(36).substr(2, 9),
-        type: "message",
-        text: message.text.trim().substring(0, 500),
-        username: user.username,
-        timestamp: message.timestamp || Date.now(),
-      };
-
-      // Сохраняем в историю
-      addToHistory(chatMessage);
-
-      // Отправляем всем
-      broadcast(chatMessage);
-      break;
-
-    case "clear_chat":
-      if (connectedUsers.size <= 2) {
-        chatHistory = [];
-        saveHistory();
-
-        broadcast({
-          type: "clear_chat",
-          username: message.username,
-          timestamp: Date.now(),
-        });
-      }
-      break;
-  }
-}
-
-// Рассылка сообщения всем подключенным клиентам
 function broadcast(message, excludeWs = null) {
   const data = JSON.stringify(message);
 
   wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN && client !== excludeWs) {
+    if (client.readyState === 1 && client !== excludeWs) {
+      // 1 = OPEN
       client.send(data);
     }
   });
 }
 
-// Рассылка количества онлайн пользователей
-function broadcastOnlineCount() {
-  broadcast({
-    type: "online_count",
-    count: connectedUsers.size,
-  });
-}
-
-// Запуск сервера
+// Запускаем сервер
 server.listen(PORT, () => {
-  loadHistory();
-  console.log(`Сервер запущен на порту ${PORT}`);
-  console.log(`Откройте http://localhost:${PORT} в браузере`);
+  console.log("=".repeat(50));
+  console.log(`🚀 Сервер запущен на порту: ${PORT}`);
+  console.log(`📁 Папка public: ${PUBLIC_DIR}`);
+  console.log(`📂 Файлы в public: ${fs.readdirSync(PUBLIC_DIR).join(", ")}`);
+  console.log("=".repeat(50));
 });
 
-// Обработка завершения работы
-process.on("SIGINT", () => {
-  console.log("\nСервер останавливается...");
-  saveHistory();
-  process.exit(0);
+// Обработка ошибок
+process.on("uncaughtException", (error) => {
+  console.error("🔥 Необработанная ошибка:", error);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("🔥 Необработанный промис:", reason);
 });
