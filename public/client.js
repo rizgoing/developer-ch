@@ -1,11 +1,16 @@
 class SimpleChat {
   constructor() {
     // Конфигурация
-    this.WS_SERVER =
-      window.location.hostname === "localhost"
-        ? "ws://localhost:3000"
-        : `wss://${window.location.hostname}:3000`;
-
+    const isLocalhost =
+      window.location.hostname === "localhost" ||
+      window.location.hostname === "127.0.0.1";
+    if (isLocalhost) {
+      this.WS_SERVER = "ws://localhost:3000";
+    } else {
+      // На Railway и других хостингах используем тот же хост и протокол, но без порта
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      this.WS_SERVER = `${protocol}//${window.location.host}`;
+    }
     // Состояние
     this.username = "";
     this.socket = null;
@@ -635,5 +640,20 @@ class SimpleChat {
 
 // Инициализация приложения
 document.addEventListener("DOMContentLoaded", () => {
+  // Проверка поддержки WebSocket
+  if (!window.WebSocket) {
+    alert("Ваш браузер не поддерживает WebSocket. Обновите браузер.");
+    return;
+  }
+
+  // Для отладки - показываем какой URL используется
+  console.log("Текущий URL:", window.location.href);
+
+  // Инициализация чата
   window.chatApp = new SimpleChat();
+
+  // Для отладки
+  setTimeout(() => {
+    console.log("WebSocket URL для подключения:", window.chatApp.WS_SERVER);
+  }, 1000);
 });
