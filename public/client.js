@@ -12,9 +12,14 @@ class SimpleChat {
     this.pendingMessages = new Map();
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 5;
-    this.notificationPermission = false;
+
+    // Для iPhone уведомлений
+    this.isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+    this.isPWA = window.matchMedia("(display-mode: standalone)").matches;
+    this.isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
     this.isTabActive = true;
-    this.lastNotificationTime = 0;
+    this.unreadCount = 0;
+    this.originalTitle = document.title;
 
     // Элементы DOM
     this.loginScreen = document.getElementById("login-screen");
@@ -49,8 +54,7 @@ class SimpleChat {
     this.setupEventListeners();
     this.loadFromStorage();
     this.checkAutoLogin();
-    this.setupNotifications();
-    this.setupTabVisibility();
+    this.setupIOSFeatures();
   }
 
   setupEventListeners() {
@@ -83,52 +87,13 @@ class SimpleChat {
 
     // Восстановление соединения
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible") {
-        if (!this.isConnected && this.isLoggedIn()) {
-          this.connectWebSocket();
-        }
-      }
-    });
-  }
-
-  setupNotifications() {
-    // Проверяем поддержку уведомлений
-    if (!("Notification" in window)) {
-      console.log("Браузер не поддерживает уведомления");
-      return;
-    }
-
-    // Проверяем текущий статус разрешения
-    if (Notification.permission === "granted") {
-      this.notificationPermission = true;
-      console.log("Уведомления разрешены");
-    } else if (Notification.permission !== "denied") {
-      // Запрашиваем разрешение не сразу, а через 3 секунды после входа
-      setTimeout(() => {
-        this.requestNotificationPermission();
-      }, 3000);
-    }
-  }
-
-  requestNotificationPermission() {
-    Notification.requestPermission().then((permission) => {
-      this.notificationPermission = permission === "granted";
-      if (this.notificationPermission) {
-        this.showNotification("Уведомления включены");
-        console.log("Разрешение на уведомления получено");
-      }
-    });
-  }
-
-  setupTabVisibility() {
-    // Отслеживаем активность вкладки
-    document.addEventListener("visibilitychange", () => {
-      this.isTabActive = !document.hidden;
+      this.handleVisibilityChange();
     });
 
-    // Также отслеживаем focus/blur окна
+    // Focus/blur для отслеживания активности вкладки
     window.addEventListener("focus", () => {
       this.isTabActive = true;
+      this.resetUnreadCount();
     });
 
     window.addEventListener("blur", () => {
@@ -136,44 +101,144 @@ class SimpleChat {
     });
   }
 
-  showBrowserNotification(title, body, tag = "chat-notification") {
-    // Не показываем уведомления, если вкладка активна
-    if (this.isTabActive) {
+  setupIOSFeatures() {
+    console.log("📱 Устройство:", this.isIOS ? "iPhone/iPad" : "Не iOS");
+    console.log("🌐 Браузер:", this.isSafari ? "Safari" : "Другой");
+    console.log(
+      "📲 PWA режим:",
+      this.isPWA ? "Да (добавлен на домашний экран)" : "Нет"
+    );
+
+    // Для iOS Safari: инициализируем звук уведомления
+    this.setupNotificationSound();
+
+    // Для iOS: запрашиваем разрешение на уведомления после первого клика
+    this.setupIOSNotificationPermission();
+  }
+
+  setupNotificationSound() {
+    // Создаем звуковой элемент для уведомлений
+    this.notificationSound = new Audio();
+    this.notificationSound.preload = "auto";
+
+    // Используем простой бип-звук через data URL
+    const beepSound =
+      "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+    this.notificationSound.src = beepSound;
+  }
+
+  setupIOSNotificationPermission() {
+    if (!this.isIOS) return;
+
+    // На iOS Safari запрашиваем разрешение при первом клике пользователя
+    const requestPermission = () => {
+      if ("Notification" in window && Notification.permission === "default") {
+        // На iOS Safari запрашиваем только если в PWA режиме
+        if (this.isPWA) {
+          Notification.requestPermission().then((permission) => {
+            console.log("Разрешение на уведомления:", permission);
+          });
+        }
+      }
+      document.removeEventListener("click", requestPermission);
+    };
+
+    document.addEventListener("click", requestPermission, { once: true });
+  }
+
+  handleVisibilityChange() {
+    if (document.visibilityState === "visible") {
+      this.isTabActive = true;
+      this.resetUnreadCount();
+
+      if (!this.isConnected && this.isLoggedIn()) {
+        this.connectWebSocket();
+      }
+    } else {
+      this.isTabActive = false;
+    }
+  }
+
+  // iPhone-специфичные уведомления
+  showIOSNotification(title, body) {
+    if (!this.isIOS) return;
+
+    // 1. Обновляем заголовок вкладки с количеством непрочитанных
+    this.unreadCount++;
+    this.updateTabTitle();
+
+    // 2. Вибрация (если поддерживается)
+    if (navigator.vibrate) {
+      navigator.vibrate([200, 100, 200]);
+    }
+
+    // 3. Звуковое уведомление (если не в беззвучном режиме)
+    if (!this.isTabActive) {
+      this.playNotificationSound();
+    }
+
+    // 4. Показываем браузерное уведомление (если разрешено и не в PWA режиме)
+    if (
+      "Notification" in window &&
+      Notification.permission === "granted" &&
+      !this.isPWA
+    ) {
+      this.showBrowserNotification(title, body);
+    }
+
+    // 5. Для PWA режима обновляем бейдж иконки
+    if (this.isPWA && navigator.setAppBadge) {
+      navigator.setAppBadge(this.unreadCount).catch(console.error);
+    }
+  }
+
+  updateTabTitle() {
+    if (this.unreadCount > 0) {
+      document.title = `(${this.unreadCount}) ${this.originalTitle}`;
+    } else {
+      document.title = this.originalTitle;
+    }
+  }
+
+  resetUnreadCount() {
+    this.unreadCount = 0;
+    this.updateTabTitle();
+
+    // Сбрасываем бейдж в PWA
+    if (this.isPWA && navigator.clearAppBadge) {
+      navigator.clearAppBadge().catch(console.error);
+    }
+  }
+
+  playNotificationSound() {
+    if (this.notificationSound) {
+      this.notificationSound.currentTime = 0;
+      this.notificationSound.play().catch((e) => {
+        // На iOS авто-воспроизведение может быть ограничено
+        console.log("Не удалось воспроизвести звук:", e.message);
+      });
+    }
+  }
+
+  showBrowserNotification(title, body) {
+    if (!("Notification" in window) || Notification.permission !== "granted") {
       return;
     }
 
-    // Не чаще чем раз в 5 секунд для одного отправителя
-    const now = Date.now();
-    if (now - this.lastNotificationTime < 5000) {
-      return;
-    }
-
-    if (!this.notificationPermission) {
-      return;
-    }
-
-    // Показываем уведомление
     const notification = new Notification(title, {
       body: body,
       icon: "/favicon.ico",
-      tag: tag, // Группирует уведомления
+      tag: "chat-notification",
       requireInteraction: false,
-      silent: false,
-      vibrate: [200, 100, 200], // Вибрация на поддерживаемых устройствах
+      silent: true, // На iOS звук управляется системой
     });
 
-    this.lastNotificationTime = now;
-
-    // При клике на уведомление активируем вкладку
     notification.onclick = () => {
       window.focus();
       notification.close();
     };
 
-    // Автоматически закрываем через 5 секунд
-    setTimeout(() => {
-      notification.close();
-    }, 5000);
+    setTimeout(() => notification.close(), 5000);
   }
 
   loadFromStorage() {
@@ -375,7 +440,6 @@ class SimpleChat {
 
       case "user_joined":
         this.showNotification(`${data.username} присоединился`);
-        this.showBrowserNotification("Чат", `${data.username} присоединился`);
         this.updateOnlineCount(data.onlineCount);
         break;
 
@@ -517,14 +581,13 @@ class SimpleChat {
       pending: false,
     };
 
-    // Показываем уведомление, если сообщение не от нас и вкладка не активна
+    // iPhone уведомление для новых сообщений не от нас
     if (!message.isOwn) {
-      this.showBrowserNotification(
-        `Новое сообщение от ${message.username}`,
-        message.text.length > 100
-          ? message.text.substring(0, 100) + "..."
-          : message.text,
-        `message-${message.username}`
+      this.showIOSNotification(
+        `💬 ${message.username}`,
+        message.text.length > 50
+          ? message.text.substring(0, 50) + "..."
+          : message.text
       );
     }
 
@@ -645,18 +708,6 @@ document.addEventListener("DOMContentLoaded", () => {
   if (!window.WebSocket) {
     alert("Ваш браузер не поддерживает WebSocket. Обновите браузер.");
     return;
-  }
-
-  // Проверка на iOS Safari - запрашиваем разрешение после жеста пользователя
-  if (/iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream) {
-    // На iOS нужно, чтобы запрос разрешения был инициирован пользовательским жестом
-    const requestPermissionOnClick = () => {
-      window.chatApp.requestNotificationPermission();
-      document.removeEventListener("click", requestPermissionOnClick);
-    };
-    document.addEventListener("click", requestPermissionOnClick, {
-      once: true,
-    });
   }
 
   window.chatApp = new SimpleChat();
