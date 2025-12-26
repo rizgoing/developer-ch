@@ -1,301 +1,549 @@
-const WebSocket = require("ws");
-const http = require("http");
-const fs = require("fs");
-const path = require("path");
+class SimpleChat {
+  constructor() {
+    // Автоматическое определение адреса WebSocket
+    this.WS_SERVER = this.getWebSocketUrl();
 
-const PORT = process.env.PORT || 3000;
-const HISTORY_FILE = path.join(__dirname, "chat_history.json");
-const MAX_HISTORY = 1000; // Увеличим до 1000 сообщений
+    // Состояние
+    this.username = "";
+    this.socket = null;
+    this.isConnected = false;
+    this.messages = [];
+    this.autoLoginAttempted = false;
+    this.pendingMessages = new Map();
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 5;
 
-// Хранилище данных
-let chatHistory = [];
-let connectedUsers = new Map();
+    // Элементы DOM
+    this.loginScreen = document.getElementById("login-screen");
+    this.chatScreen = document.getElementById("chat-screen");
+    this.usernameInput = document.getElementById("username");
+    this.loginBtn = document.getElementById("login-btn");
+    this.messagesContainer = document.getElementById("messages-container");
+    this.messageInput = document.getElementById("message-input");
+    this.sendBtn = document.getElementById("send-btn");
+    this.backBtn = document.getElementById("back-btn");
+    this.clearBtn = document.getElementById("clear-btn");
+    this.onlineCount = document.getElementById("online-count");
+    this.connectionStatus = document.getElementById("connection-status");
+    this.emptyState = document.getElementById("empty-state");
 
-// Загружаем историю из файла
-function loadHistory() {
-  try {
-    if (fs.existsSync(HISTORY_FILE)) {
-      const data = fs.readFileSync(HISTORY_FILE, "utf8");
-      const parsed = JSON.parse(data);
-      // Оставляем только последние MAX_HISTORY сообщений
-      chatHistory = parsed.slice(-MAX_HISTORY);
-      console.log(`✅ Загружено ${chatHistory.length} сообщений из истории`);
+    this.init();
+  }
+
+  getWebSocketUrl() {
+    if (
+      window.location.hostname === "localhost" ||
+      window.location.hostname === "127.0.0.1"
+    ) {
+      return "ws://localhost:3000";
     }
-  } catch (error) {
-    console.error("❌ Ошибка загрузки истории:", error.message);
-    chatHistory = [];
-  }
-}
 
-// Сохраняем историю в файл
-function saveHistory() {
-  try {
-    // Сохраняем только последние MAX_HISTORY сообщений
-    const toSave = chatHistory.slice(-MAX_HISTORY);
-    fs.writeFileSync(HISTORY_FILE, JSON.stringify(toSave, null, 2));
-    console.log(`💾 История сохранена (${toSave.length} сообщений)`);
-  } catch (error) {
-    console.error("❌ Ошибка сохранения истории:", error.message);
-  }
-}
-
-// Добавляем сообщение в историю
-function addToHistory(message) {
-  chatHistory.push(message);
-
-  // Ограничиваем размер истории
-  if (chatHistory.length > MAX_HISTORY) {
-    chatHistory = chatHistory.slice(-MAX_HISTORY);
+    const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${wsProtocol}//${window.location.host}`;
   }
 
-  // Сохраняем на диск каждое сообщение
-  saveHistory();
-}
-
-// Создаем HTTP сервер
-const server = http.createServer((req, res) => {
-  console.log(`📥 ${req.method} ${req.url}`);
-
-  // Игнорируем favicon.ico если нет файла
-  if (req.url === "/favicon.ico") {
-    res.writeHead(204);
-    res.end();
-    return;
+  init() {
+    this.setupEventListeners();
+    this.loadFromStorage();
+    this.checkAutoLogin();
   }
 
-  // Определяем путь к файлу
-  let filePath = req.url === "/" ? "/index.html" : req.url;
-  const fullPath = path.join(__dirname, "public", filePath);
+  setupEventListeners() {
+    // Вход
+    this.loginBtn.addEventListener("click", () => this.login());
+    this.usernameInput.addEventListener("keypress", (e) => {
+      if (e.key === "Enter") this.login();
+    });
 
-  // Проверяем, существует ли файл
-  fs.readFile(fullPath, (err, content) => {
-    if (err) {
-      // Если файл не найден, показываем index.html (для SPA)
-      if (err.code === "ENOENT") {
-        fs.readFile(
-          path.join(__dirname, "public", "index.html"),
-          (err, data) => {
-            if (err) {
-              res.writeHead(500, { "Content-Type": "text/plain" });
-              res.end("Server Error: Cannot load index.html");
-            } else {
-              res.writeHead(200, { "Content-Type": "text/html" });
-              res.end(data);
-            }
-          }
-        );
-      } else {
-        res.writeHead(500, { "Content-Type": "text/plain" });
-        res.end(`Server Error: ${err.code}`);
+    // Отправка сообщений
+    this.sendBtn.addEventListener("click", () => this.sendMessage());
+    this.messageInput.addEventListener("keypress", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        this.sendMessage();
       }
-      return;
-    }
+    });
+    this.messageInput.addEventListener("input", () => {
+      this.sendBtn.disabled = !this.messageInput.value.trim();
+    });
 
-    // Определяем Content-Type
-    const ext = path.extname(fullPath);
-    let contentType = "text/html";
+    // Навигация
+    this.backBtn.addEventListener("click", () => this.goBack());
+    this.clearBtn.addEventListener("click", () => this.clearChat());
 
-    switch (ext) {
-      case ".js":
-        contentType = "application/javascript";
-        break;
-      case ".css":
-        contentType = "text/css";
-        break;
-      case ".json":
-        contentType = "application/json";
-        break;
-      case ".png":
-        contentType = "image/png";
-        break;
-      case ".jpg":
-      case ".jpeg":
-        contentType = "image/jpeg";
-        break;
-      case ".ico":
-        contentType = "image/x-icon";
-        break;
-    }
+    // Сохранение состояния
+    window.addEventListener("beforeunload", () => {
+      this.saveToStorage();
+    });
 
-    res.writeHead(200, { "Content-Type": contentType });
-    res.end(content);
-  });
-});
+    // Восстановление соединения
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        if (!this.isConnected && this.isLoggedIn()) {
+          this.connectWebSocket();
+        }
+      }
+    });
+  }
 
-// WebSocket сервер
-const wss = new WebSocket.Server({ server });
-
-// Загружаем историю при старте сервера
-loadHistory();
-
-wss.on("connection", (ws) => {
-  console.log("🔗 Новое WebSocket подключение");
-
-  // Сразу отправляем историю чата новому пользователю
-  ws.send(
-    JSON.stringify({
-      type: "history",
-      messages: chatHistory,
-    })
-  );
-
-  ws.on("message", (data) => {
+  loadFromStorage() {
     try {
-      const message = JSON.parse(data);
+      const savedState = localStorage.getItem("chat_state");
+      if (savedState) {
+        const state = JSON.parse(savedState);
 
-      if (message.type === "join") {
-        // Проверяем, нет ли уже пользователя с таким именем
-        const existingUser = Array.from(connectedUsers.values()).find(
-          (user) => user.username === message.username
-        );
-
-        if (existingUser) {
-          ws.send(
-            JSON.stringify({
-              type: "error",
-              message: "Пользователь с таким именем уже в чате",
-            })
-          );
-          ws.close();
-          return;
+        if (state.username) {
+          this.usernameInput.value = state.username;
         }
 
-        // Добавляем пользователя
-        const user = { ws, username: message.username };
-        connectedUsers.set(ws, user);
-
-        console.log(`👤 ${message.username} присоединился`);
-
-        // Уведомляем всех о новом пользователе
-        broadcast(
-          {
-            type: "user_joined",
-            username: message.username,
-            onlineCount: connectedUsers.size,
-            timestamp: Date.now(),
-          },
-          ws
-        );
-
-        // Отправляем обновлённое количество онлайн
-        broadcastOnlineCount();
-      }
-
-      if (message.type === "message") {
-        const user = connectedUsers.get(ws);
-        if (!user) return;
-
-        // Создаём сообщение с уникальным ID
-        const chatMessage = {
-          id:
-            message.id ||
-            Date.now() + "-" + Math.random().toString(36).substr(2, 9),
-          type: "message",
-          text: message.text.substring(0, 500),
-          username: user.username,
-          timestamp: message.timestamp || Date.now(),
-        };
-
-        console.log(
-          `💬 ${user.username}: ${chatMessage.text.substring(0, 50)}${
-            chatMessage.text.length > 50 ? "..." : ""
-          }`
-        );
-
-        // Сохраняем в историю
-        addToHistory(chatMessage);
-
-        // Отправляем всем
-        broadcast(chatMessage);
-      }
-
-      if (message.type === "clear_chat") {
-        const user = connectedUsers.get(ws);
-        if (user && connectedUsers.size <= 2) {
-          chatHistory = [];
-          saveHistory();
-
-          console.log(`🧹 ${user.username} очистил чат`);
-
-          broadcast({
-            type: "clear_chat",
-            username: user.username,
-            timestamp: Date.now(),
-          });
+        if (state.messages && Array.isArray(state.messages)) {
+          this.messages = state.messages.map((msg) => ({
+            ...msg,
+            pending: false,
+          }));
         }
       }
     } catch (error) {
-      console.error("❌ Ошибка обработки сообщения:", error);
+      console.error("Ошибка загрузки из localStorage:", error);
     }
-  });
+  }
 
-  ws.on("close", () => {
-    const user = connectedUsers.get(ws);
-    if (user) {
-      console.log(`👋 ${user.username} отключился`);
-      connectedUsers.delete(ws);
+  saveToStorage() {
+    try {
+      const nonPendingMessages = this.messages
+        .filter((msg) => !msg.pending)
+        .slice(-50);
 
-      broadcast({
-        type: "user_left",
-        username: user.username,
-        onlineCount: connectedUsers.size,
+      const state = {
+        username: this.username,
+        messages: nonPendingMessages,
         timestamp: Date.now(),
-      });
+      };
 
-      broadcastOnlineCount();
+      localStorage.setItem("chat_state", JSON.stringify(state));
+    } catch (error) {
+      console.error("Ошибка сохранения в localStorage:", error);
     }
-  });
+  }
 
-  ws.on("error", (error) => {
-    console.error("❌ WebSocket ошибка:", error);
-  });
-});
+  clearStorage() {
+    localStorage.removeItem("chat_state");
+    localStorage.removeItem("chat_username");
+  }
 
-function broadcast(message, excludeWs = null) {
-  const data = JSON.stringify(message);
+  isLoggedIn() {
+    return !!this.username && this.username.trim().length > 0;
+  }
 
-  wss.clients.forEach((client) => {
-    if (client.readyState === 1 && client !== excludeWs) {
-      // 1 = OPEN
-      client.send(data);
+  checkAutoLogin() {
+    const savedUsername = localStorage.getItem("chat_username");
+    const savedState = localStorage.getItem("chat_state");
+
+    if (savedUsername && savedState && !this.autoLoginAttempted) {
+      try {
+        const state = JSON.parse(savedState);
+        const twoHoursAgo = Date.now() - 2 * 60 * 60 * 1000;
+
+        if (state.timestamp && state.timestamp > twoHoursAgo) {
+          this.autoLoginAttempted = true;
+
+          setTimeout(() => {
+            this.username = savedUsername;
+            this.loginScreen.classList.remove("active");
+            this.chatScreen.classList.add("active");
+            this.connectWebSocket();
+          }, 300);
+
+          return;
+        }
+      } catch (error) {
+        console.error("Ошибка авто-входа:", error);
+      }
     }
-  });
-}
 
-function broadcastOnlineCount() {
-  broadcast({
-    type: "online_count",
-    count: connectedUsers.size,
-    timestamp: Date.now(),
-  });
-}
+    setTimeout(() => {
+      this.usernameInput.focus();
+    }, 300);
+  }
 
-// Запускаем сервер
-server.listen(PORT, () => {
-  console.log("=".repeat(50));
-  console.log(`🚀 Сервер запущен на порту: ${PORT}`);
-  console.log(`💾 История загружена: ${chatHistory.length} сообщений`);
-  console.log(`💬 Максимум сообщений в истории: ${MAX_HISTORY}`);
-  console.log("=".repeat(50));
-});
+  login() {
+    const username = this.usernameInput.value.trim();
 
-// Обработка ошибок
-process.on("uncaughtException", (error) => {
-  console.error("🔥 Необработанная ошибка:", error);
-});
+    if (!username) {
+      this.showNotification("Введите имя");
+      this.usernameInput.focus();
+      return;
+    }
 
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("🔥 Необработанный промис:", reason);
-});
+    if (username.length < 2) {
+      this.showNotification("Имя должно быть минимум 2 символа");
+      return;
+    }
 
-// Graceful shutdown
-process.on("SIGINT", () => {
-  console.log("\n🛑 Остановка сервера...");
-  saveHistory();
-  wss.close(() => {
-    server.close(() => {
-      console.log("✅ Сервер остановлен");
-      process.exit(0);
+    if (username.length > 20) {
+      this.showNotification("Имя должно быть не более 20 символов");
+      return;
+    }
+
+    this.username = username;
+    localStorage.setItem("chat_username", username);
+    this.saveToStorage();
+
+    this.loginScreen.classList.remove("active");
+    this.chatScreen.classList.add("active");
+    this.connectWebSocket();
+
+    setTimeout(() => {
+      this.messageInput.focus();
+    }, 300);
+  }
+
+  connectWebSocket() {
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      return;
+    }
+
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      this.showNotification("Не удалось подключиться. Проверьте интернет.");
+      return;
+    }
+
+    this.updateConnectionStatus("Подключение...");
+
+    try {
+      this.socket = new WebSocket(this.WS_SERVER);
+
+      this.socket.onopen = () => {
+        this.isConnected = true;
+        this.reconnectAttempts = 0;
+        this.updateConnectionStatus("В сети");
+
+        this.socket.send(
+          JSON.stringify({
+            type: "join",
+            username: this.username,
+            timestamp: Date.now(),
+          })
+        );
+
+        if (this.messages.length > 0) {
+          this.renderMessages();
+        }
+
+        this.showNotification("Подключено к чату");
+      };
+
+      this.socket.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          this.handleWebSocketMessage(data);
+          this.saveToStorage();
+        } catch (error) {
+          console.error("Ошибка парсинга сообщения:", error);
+        }
+      };
+
+      this.socket.onclose = (event) => {
+        this.isConnected = false;
+        this.reconnectAttempts++;
+
+        if (event.code === 1006) {
+          this.updateConnectionStatus("Переподключение...");
+        } else {
+          this.updateConnectionStatus("Отключено");
+        }
+
+        if (this.isLoggedIn()) {
+          const delay = Math.min(1000 * this.reconnectAttempts, 10000);
+          setTimeout(() => {
+            if (!this.isConnected) {
+              this.connectWebSocket();
+            }
+          }, delay);
+        }
+      };
+
+      this.socket.onerror = (error) => {
+        console.error("WebSocket ошибка:", error);
+        this.updateConnectionStatus("Ошибка подключения");
+      };
+    } catch (error) {
+      console.error("Ошибка подключения:", error);
+      this.showNotification("Ошибка подключения к серверу");
+    }
+  }
+
+  handleWebSocketMessage(data) {
+    switch (data.type) {
+      case "history":
+        this.mergeMessagesWithHistory(data.messages || []);
+        break;
+
+      case "message":
+        this.handleNewMessage(data);
+        break;
+
+      case "user_joined":
+        this.showNotification(`${data.username} присоединился`);
+        this.updateOnlineCount(data.onlineCount);
+        break;
+
+      case "user_left":
+        this.showNotification(`${data.username} вышел`);
+        this.updateOnlineCount(data.onlineCount);
+        break;
+
+      case "online_count":
+        this.updateOnlineCount(data.count);
+        break;
+
+      case "clear_chat":
+        this.messages = [];
+        this.pendingMessages.clear();
+        this.renderMessages();
+        this.saveToStorage();
+        this.showNotification("Чат очищен");
+        break;
+
+      case "error":
+        this.showNotification(`Ошибка: ${data.message}`);
+        if (data.message.includes("уже в чате")) {
+          setTimeout(() => this.goBack(), 2000);
+        }
+        break;
+    }
+  }
+
+  mergeMessagesWithHistory(serverMessages) {
+    // Создаем Set для быстрой проверки ID сообщений
+    const existingMessageIds = new Set(this.messages.map((msg) => msg.id));
+
+    // Добавляем только новые сообщения
+    serverMessages.forEach((serverMsg) => {
+      if (!existingMessageIds.has(serverMsg.id)) {
+        this.messages.push({
+          ...serverMsg,
+          isOwn: serverMsg.username === this.username,
+          pending: false,
+        });
+      }
     });
-  });
+
+    // Сортируем по времени
+    this.messages.sort((a, b) => a.timestamp - b.timestamp);
+
+    // Ограничиваем количество сообщений
+    if (this.messages.length > 200) {
+      this.messages = this.messages.slice(-200);
+    }
+
+    this.renderMessages();
+  }
+
+  renderMessages() {
+    this.messagesContainer.innerHTML = "";
+
+    if (this.messages.length === 0) {
+      this.emptyState.style.display = "block";
+      return;
+    }
+
+    this.emptyState.style.display = "none";
+
+    this.messages.forEach((message) => {
+      this.renderMessage(message);
+    });
+
+    this.scrollToBottom();
+  }
+
+  renderMessage(message) {
+    const messageElement = document.createElement("div");
+    messageElement.className = `message ${message.isOwn ? "sent" : "received"}`;
+
+    if (message.pending) {
+      messageElement.classList.add("pending");
+    }
+
+    const time = new Date(message.timestamp).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+
+    messageElement.innerHTML = `
+            <div class="message-content">
+                ${this.escapeHtml(message.text)}
+                ${
+                  message.pending
+                    ? '<span class="pending-indicator"><i class="fas fa-clock"></i></span>'
+                    : ""
+                }
+            </div>
+            <div class="message-info">
+                <span class="message-sender">${
+                  message.isOwn ? "Вы" : this.escapeHtml(message.username)
+                }</span>
+                <span class="message-time">${time}</span>
+            </div>
+        `;
+
+    this.messagesContainer.appendChild(messageElement);
+  }
+
+  scrollToBottom() {
+    setTimeout(() => {
+      this.messagesContainer.scrollTop = this.messagesContainer.scrollHeight;
+    }, 50);
+  }
+
+  handleNewMessage(data) {
+    const pendingLocalId = this.pendingMessages.get(data.id);
+
+    if (pendingLocalId) {
+      const pendingIndex = this.messages.findIndex(
+        (msg) => msg.localId === pendingLocalId
+      );
+
+      if (pendingIndex !== -1) {
+        this.messages[pendingIndex] = {
+          ...this.messages[pendingIndex],
+          id: data.id,
+          pending: false,
+        };
+
+        this.pendingMessages.delete(data.id);
+        this.renderMessages();
+        return;
+      }
+    }
+
+    const message = {
+      id: data.id,
+      text: data.text,
+      username: data.username,
+      timestamp: data.timestamp || Date.now(),
+      isOwn: data.username === this.username,
+      pending: false,
+    };
+
+    this.messages.push(message);
+    this.renderMessage(message);
+    this.scrollToBottom();
+  }
+
+  sendMessage() {
+    const text = this.messageInput.value.trim();
+
+    if (!text || !this.isConnected) {
+      return;
+    }
+
+    const localId = Date.now() + "-" + Math.random().toString(36).substr(2, 9);
+    const timestamp = Date.now();
+
+    const message = {
+      type: "message",
+      id: localId,
+      text: text,
+      username: this.username,
+      timestamp: timestamp,
+    };
+
+    const localMessage = {
+      localId: localId,
+      text: text,
+      username: this.username,
+      timestamp: timestamp,
+      isOwn: true,
+      pending: true,
+    };
+
+    this.pendingMessages.set(localId, localId);
+    this.messages.push(localMessage);
+    this.renderMessage(localMessage);
+    this.scrollToBottom();
+
+    this.socket.send(JSON.stringify(message));
+
+    this.messageInput.value = "";
+    this.sendBtn.disabled = true;
+    this.saveToStorage();
+  }
+
+  updateOnlineCount(count) {
+    this.onlineCount.textContent = count || 1;
+  }
+
+  updateConnectionStatus(status) {
+    this.connectionStatus.textContent = status;
+  }
+
+  clearChat() {
+    if (confirm("Очистить историю чата?")) {
+      if (this.isConnected) {
+        this.socket.send(
+          JSON.stringify({
+            type: "clear_chat",
+            username: this.username,
+            timestamp: Date.now(),
+          })
+        );
+      }
+
+      this.messages = [];
+      this.pendingMessages.clear();
+      this.renderMessages();
+      this.saveToStorage();
+      this.showNotification("Чат очищен");
+    }
+  }
+
+  goBack() {
+    if (confirm("Выйти из чата?")) {
+      if (this.socket && this.isConnected) {
+        this.socket.close();
+      }
+
+      this.clearStorage();
+
+      this.chatScreen.classList.remove("active");
+      this.loginScreen.classList.add("active");
+      this.usernameInput.value = "";
+      this.username = "";
+      this.messages = [];
+      this.pendingMessages.clear();
+      this.isConnected = false;
+      this.reconnectAttempts = 0;
+
+      setTimeout(() => {
+        this.usernameInput.focus();
+      }, 300);
+    }
+  }
+
+  showNotification(text) {
+    const notification = document.getElementById("notification");
+    notification.textContent = text;
+    notification.classList.add("show");
+
+    setTimeout(() => {
+      notification.classList.remove("show");
+    }, 3000);
+  }
+
+  escapeHtml(text) {
+    const div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+  }
+}
+
+// Инициализация
+document.addEventListener("DOMContentLoaded", () => {
+  if (!window.WebSocket) {
+    alert("Ваш браузер не поддерживает WebSocket. Обновите браузер.");
+    return;
+  }
+
+  window.chatApp = new SimpleChat();
 });
