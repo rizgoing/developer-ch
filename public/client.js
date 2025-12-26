@@ -113,10 +113,10 @@ class SimpleChat {
 
   saveToStorage() {
     try {
-      // Сохраняем только не-pending сообщения
+      // Сохраняем только последние 200 не-pending сообщений
       const nonPendingMessages = this.messages
         .filter((msg) => !msg.pending)
-        .slice(-50); // Сохраняем последние 50 сообщений
+        .slice(-200);
 
       const state = {
         username: this.username,
@@ -126,8 +126,13 @@ class SimpleChat {
       };
 
       localStorage.setItem("chat_state", JSON.stringify(state));
+      console.log(
+        "💾 Состояние сохранено:",
+        nonPendingMessages.length,
+        "сообщений"
+      );
     } catch (error) {
-      console.error("Ошибка сохранения в localStorage:", error);
+      console.error("❌ Ошибка сохранения в localStorage:", error);
     }
   }
 
@@ -287,24 +292,29 @@ class SimpleChat {
   }
 
   handleWebSocketMessage(data) {
+    console.log("📨 Получено сообщение от сервера:", data.type, data);
+
     switch (data.type) {
       case "history":
-        // Объединяем локальные сообщения с историей с сервера
+        console.log(
+          "📚 Получена история сообщений:",
+          data.messages?.length || 0,
+          "сообщений"
+        );
         this.mergeMessagesWithHistory(data.messages || []);
         break;
 
       case "message":
-        // Обрабатываем новое сообщение
         this.handleNewMessage(data);
         break;
 
       case "user_joined":
-        this.showNotification(`${data.username} присоединился`);
+        this.showNotification(`👤 ${data.username} присоединился`);
         this.updateOnlineCount(data.onlineCount);
         break;
 
       case "user_left":
-        this.showNotification(`${data.username} вышел`);
+        this.showNotification(`👋 ${data.username} вышел`);
         this.updateOnlineCount(data.onlineCount);
         break;
 
@@ -317,69 +327,82 @@ class SimpleChat {
         this.pendingMessages.clear();
         this.renderMessages();
         this.saveToStorage();
-        this.showNotification("Чат очищен");
+        this.showNotification("🧹 Чат очищен");
         break;
 
       case "error":
-        this.showNotification(`Ошибка: ${data.message}`);
+        this.showNotification(`❌ Ошибка: ${data.message}`);
+        if (data.message.includes("уже в чате")) {
+          setTimeout(() => this.goBack(), 2000);
+        }
         break;
     }
   }
 
   mergeMessagesWithHistory(serverMessages) {
-    // Создаем карту сообщений с сервера для быстрого поиска
-    const serverMessagesMap = new Map();
-    serverMessages.forEach((msg) => {
-      if (msg.id) {
-        serverMessagesMap.set(msg.id, msg);
-      }
+    console.log("🔄 Объединение истории:", {
+      локальных: this.messages.length,
+      сСервера: serverMessages.length,
     });
 
-    // Обновляем pending сообщения на основе истории с сервера
-    this.messages = this.messages.map((localMsg) => {
-      // Если это pending сообщение и оно есть на сервере, снимаем pending статус
-      if (localMsg.pending && localMsg.localId) {
-        const serverMsg = serverMessagesMap.get(localMsg.localId);
-        if (serverMsg) {
-          return {
-            ...serverMsg,
-            isOwn: serverMsg.username === this.username,
-            pending: false,
-          };
-        }
-      }
-      return localMsg;
-    });
+    // Если серверная история пуста, ничего не делаем
+    if (!serverMessages || serverMessages.length === 0) {
+      console.log("📭 История с сервера пуста");
+      return;
+    }
 
-    // Добавляем новые сообщения с сервера
+    // Сортируем серверные сообщения по времени
+    serverMessages.sort((a, b) => a.timestamp - b.timestamp);
+
+    // Создаем Set для быстрой проверки ID сообщений
+    const existingMessageIds = new Set(this.messages.map((msg) => msg.id));
+    const existingLocalIds = new Set(
+      this.messages.map((msg) => msg.localId).filter((id) => id)
+    );
+
+    // Добавляем только новые сообщения с сервера
+    let addedCount = 0;
     serverMessages.forEach((serverMsg) => {
-      const exists = this.messages.some(
-        (msg) =>
-          msg.id === serverMsg.id ||
-          (msg.localId && msg.localId === serverMsg.id)
-      );
+      // Проверяем, есть ли такое сообщение уже у нас
+      const alreadyExists =
+        existingMessageIds.has(serverMsg.id) ||
+        (serverMsg.id && existingLocalIds.has(serverMsg.id));
 
-      if (!exists) {
-        this.messages.push({
+      if (!alreadyExists) {
+        const message = {
           ...serverMsg,
           isOwn: serverMsg.username === this.username,
           pending: false,
-        });
+        };
+
+        this.messages.push(message);
+        addedCount++;
       }
     });
 
-    // Сортируем по времени
+    // Сортируем все сообщения по времени
     this.messages.sort((a, b) => a.timestamp - b.timestamp);
 
     // Ограничиваем количество сообщений в памяти
-    if (this.messages.length > 200) {
-      this.messages = this.messages.slice(-200);
+    if (this.messages.length > 500) {
+      this.messages = this.messages.slice(-500);
     }
 
+    console.log(`✅ Добавлено ${addedCount} новых сообщений из истории`);
+
+    // Перерисовываем сообщения
     this.renderMessages();
+
+    // Прокручиваем вниз
+    this.scrollToBottom();
+
+    // Сохраняем обновлённую историю
+    this.saveToStorage();
   }
 
   handleNewMessage(data) {
+    console.log("💬 Новое сообщение от сервера:", data);
+
     // Проверяем, не является ли это подтверждением нашего pending сообщения
     const pendingLocalId = this.pendingMessages.get(data.id);
 
@@ -397,6 +420,8 @@ class SimpleChat {
           pending: false,
         };
 
+        console.log("✅ Pending сообщение подтверждено");
+
         // Обновляем отображение
         this.updateMessageInDOM(this.messages[pendingIndex]);
 
@@ -406,6 +431,16 @@ class SimpleChat {
         this.scrollToBottom();
         return;
       }
+    }
+
+    // Проверяем, нет ли уже такого сообщения (дубликат)
+    const alreadyExists = this.messages.some(
+      (msg) => msg.id === data.id || (data.id && msg.localId === data.id)
+    );
+
+    if (alreadyExists) {
+      console.log("⚠️ Сообщение уже существует, пропускаем");
+      return;
     }
 
     // Обычное новое сообщение
@@ -421,108 +456,9 @@ class SimpleChat {
     this.messages.push(message);
     this.renderMessage(message);
     this.scrollToBottom();
-  }
 
-  sendMessage() {
-    const text = this.messageInput.value.trim();
-
-    if (!text || !this.isConnected) {
-      return;
-    }
-
-    const localId = Date.now() + "-" + Math.random().toString(36).substr(2, 9);
-    const timestamp = Date.now();
-
-    // Сообщение для отправки на сервер
-    const message = {
-      type: "message",
-      id: localId,
-      text: text,
-      username: this.username,
-      timestamp: timestamp,
-    };
-
-    // Локальное сообщение для немедленного отображения
-    const localMessage = {
-      localId: localId,
-      text: text,
-      username: this.username,
-      timestamp: timestamp,
-      isOwn: true,
-      pending: true,
-    };
-
-    // Сохраняем связь localId -> serverId для последующего обновления
-    this.pendingMessages.set(localId, localId);
-
-    this.messages.push(localMessage);
-    this.renderMessage(localMessage);
-    this.scrollToBottom();
-
-    // Отправляем на сервер
-    this.socket.send(JSON.stringify(message));
-
-    // Очищаем поле ввода
-    this.messageInput.value = "";
-    this.sendBtn.disabled = true;
-
-    // Сохраняем состояние
+    // Сохраняем в localStorage
     this.saveToStorage();
-  }
-
-  renderMessages() {
-    this.messagesContainer.innerHTML = "";
-
-    if (this.messages.length === 0) {
-      this.emptyState.style.display = "block";
-      return;
-    }
-
-    this.emptyState.style.display = "none";
-
-    this.messages.forEach((message) => {
-      this.renderMessage(message);
-    });
-
-    this.scrollToBottom();
-  }
-
-  renderMessage(message) {
-    if (this.emptyState.style.display !== "none") {
-      this.emptyState.style.display = "none";
-    }
-
-    const messageElement = document.createElement("div");
-    messageElement.className = `message ${message.isOwn ? "sent" : "received"}`;
-    messageElement.dataset.id = message.id || message.localId;
-
-    if (message.pending) {
-      messageElement.classList.add("pending");
-    }
-
-    const time = new Date(message.timestamp).toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-
-    messageElement.innerHTML = `
-            <div class="message-content">
-                ${this.escapeHtml(message.text)}
-                ${
-                  message.pending
-                    ? '<span class="pending-indicator"><i class="fas fa-clock"></i></span>'
-                    : ""
-                }
-            </div>
-            <div class="message-info">
-                <span class="message-sender">${
-                  message.isOwn ? "Вы" : this.escapeHtml(message.username)
-                }</span>
-                <span class="message-time">${time}</span>
-            </div>
-        `;
-
-    this.messagesContainer.appendChild(messageElement);
   }
 
   updateMessageInDOM(message) {

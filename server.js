@@ -4,29 +4,55 @@ const fs = require("fs");
 const path = require("path");
 
 const PORT = process.env.PORT || 3000;
-const PUBLIC_DIR = path.join(__dirname, "public");
+const HISTORY_FILE = path.join(__dirname, "chat_history.json");
+const MAX_HISTORY = 1000; // Увеличим до 1000 сообщений
 
-// Убедимся, что папка public существует
-if (!fs.existsSync(PUBLIC_DIR)) {
-  console.log("⚠️ Папка public не найдена, создаю...");
-  fs.mkdirSync(PUBLIC_DIR, { recursive: true });
+// Хранилище данных
+let chatHistory = [];
+let connectedUsers = new Map();
 
-  // Создаем базовый index.html если его нет
-  const basicHTML = `<!DOCTYPE html>
-<html>
-<head>
-    <title>Chat Loading...</title>
-    <style>body { font-family: Arial; padding: 50px; text-align: center; }</style>
-</head>
-<body>
-    <h1>Chat is loading...</h1>
-    <p>If you see this, static files are being served.</p>
-</body>
-</html>`;
-
-  fs.writeFileSync(path.join(PUBLIC_DIR, "index.html"), basicHTML);
+// Загружаем историю из файла
+function loadHistory() {
+  try {
+    if (fs.existsSync(HISTORY_FILE)) {
+      const data = fs.readFileSync(HISTORY_FILE, "utf8");
+      const parsed = JSON.parse(data);
+      // Оставляем только последние MAX_HISTORY сообщений
+      chatHistory = parsed.slice(-MAX_HISTORY);
+      console.log(`✅ Загружено ${chatHistory.length} сообщений из истории`);
+    }
+  } catch (error) {
+    console.error("❌ Ошибка загрузки истории:", error.message);
+    chatHistory = [];
+  }
 }
 
+// Сохраняем историю в файл
+function saveHistory() {
+  try {
+    // Сохраняем только последние MAX_HISTORY сообщений
+    const toSave = chatHistory.slice(-MAX_HISTORY);
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(toSave, null, 2));
+    console.log(`💾 История сохранена (${toSave.length} сообщений)`);
+  } catch (error) {
+    console.error("❌ Ошибка сохранения истории:", error.message);
+  }
+}
+
+// Добавляем сообщение в историю
+function addToHistory(message) {
+  chatHistory.push(message);
+
+  // Ограничиваем размер истории
+  if (chatHistory.length > MAX_HISTORY) {
+    chatHistory = chatHistory.slice(-MAX_HISTORY);
+  }
+
+  // Сохраняем на диск каждое сообщение
+  saveHistory();
+}
+
+// Создаем HTTP сервер
 const server = http.createServer((req, res) => {
   console.log(`📥 ${req.method} ${req.url}`);
 
@@ -39,22 +65,25 @@ const server = http.createServer((req, res) => {
 
   // Определяем путь к файлу
   let filePath = req.url === "/" ? "/index.html" : req.url;
-  const fullPath = path.join(PUBLIC_DIR, filePath);
+  const fullPath = path.join(__dirname, "public", filePath);
 
   // Проверяем, существует ли файл
   fs.readFile(fullPath, (err, content) => {
     if (err) {
       // Если файл не найден, показываем index.html (для SPA)
       if (err.code === "ENOENT") {
-        fs.readFile(path.join(PUBLIC_DIR, "index.html"), (err, data) => {
-          if (err) {
-            res.writeHead(500, { "Content-Type": "text/plain" });
-            res.end("Server Error: Cannot load index.html");
-          } else {
-            res.writeHead(200, { "Content-Type": "text/html" });
-            res.end(data);
+        fs.readFile(
+          path.join(__dirname, "public", "index.html"),
+          (err, data) => {
+            if (err) {
+              res.writeHead(500, { "Content-Type": "text/plain" });
+              res.end("Server Error: Cannot load index.html");
+            } else {
+              res.writeHead(200, { "Content-Type": "text/html" });
+              res.end(data);
+            }
           }
-        });
+        );
       } else {
         res.writeHead(500, { "Content-Type": "text/plain" });
         res.end(`Server Error: ${err.code}`);
@@ -96,10 +125,19 @@ const server = http.createServer((req, res) => {
 // WebSocket сервер
 const wss = new WebSocket.Server({ server });
 
-let users = [];
+// Загружаем историю при старте сервера
+loadHistory();
 
 wss.on("connection", (ws) => {
   console.log("🔗 Новое WebSocket подключение");
+
+  // Сразу отправляем историю чата новому пользователю
+  ws.send(
+    JSON.stringify({
+      type: "history",
+      messages: chatHistory,
+    })
+  );
 
   ws.on("message", (data) => {
     try {
@@ -107,7 +145,10 @@ wss.on("connection", (ws) => {
 
       if (message.type === "join") {
         // Проверяем, нет ли уже пользователя с таким именем
-        const existingUser = users.find((u) => u.username === message.username);
+        const existingUser = Array.from(connectedUsers.values()).find(
+          (user) => user.username === message.username
+        );
+
         if (existingUser) {
           ws.send(
             JSON.stringify({
@@ -121,47 +162,67 @@ wss.on("connection", (ws) => {
 
         // Добавляем пользователя
         const user = { ws, username: message.username };
-        users.push(user);
+        connectedUsers.set(ws, user);
 
         console.log(`👤 ${message.username} присоединился`);
-
-        // Отправляем историю (пустую для простоты)
-        ws.send(
-          JSON.stringify({
-            type: "history",
-            messages: [],
-          })
-        );
 
         // Уведомляем всех о новом пользователе
         broadcast(
           {
             type: "user_joined",
             username: message.username,
-            onlineCount: users.length,
+            onlineCount: connectedUsers.size,
+            timestamp: Date.now(),
           },
           ws
         );
+
+        // Отправляем обновлённое количество онлайн
+        broadcastOnlineCount();
       }
 
       if (message.type === "message") {
-        const user = users.find((u) => u.ws === ws);
+        const user = connectedUsers.get(ws);
         if (!user) return;
 
+        // Создаём сообщение с уникальным ID
         const chatMessage = {
+          id:
+            message.id ||
+            Date.now() + "-" + Math.random().toString(36).substr(2, 9),
           type: "message",
-          id: Date.now(),
           text: message.text.substring(0, 500),
           username: user.username,
-          timestamp: Date.now(),
+          timestamp: message.timestamp || Date.now(),
         };
 
         console.log(
-          `💬 ${user.username}: ${chatMessage.text.substring(0, 50)}`
+          `💬 ${user.username}: ${chatMessage.text.substring(0, 50)}${
+            chatMessage.text.length > 50 ? "..." : ""
+          }`
         );
+
+        // Сохраняем в историю
+        addToHistory(chatMessage);
 
         // Отправляем всем
         broadcast(chatMessage);
+      }
+
+      if (message.type === "clear_chat") {
+        const user = connectedUsers.get(ws);
+        if (user && connectedUsers.size <= 2) {
+          chatHistory = [];
+          saveHistory();
+
+          console.log(`🧹 ${user.username} очистил чат`);
+
+          broadcast({
+            type: "clear_chat",
+            username: user.username,
+            timestamp: Date.now(),
+          });
+        }
       }
     } catch (error) {
       console.error("❌ Ошибка обработки сообщения:", error);
@@ -169,17 +230,19 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    const userIndex = users.findIndex((u) => u.ws === ws);
-    if (userIndex !== -1) {
-      const username = users[userIndex].username;
-      users.splice(userIndex, 1);
-      console.log(`👋 ${username} отключился`);
+    const user = connectedUsers.get(ws);
+    if (user) {
+      console.log(`👋 ${user.username} отключился`);
+      connectedUsers.delete(ws);
 
       broadcast({
         type: "user_left",
-        username: username,
-        onlineCount: users.length,
+        username: user.username,
+        onlineCount: connectedUsers.size,
+        timestamp: Date.now(),
       });
+
+      broadcastOnlineCount();
     }
   });
 
@@ -199,12 +262,20 @@ function broadcast(message, excludeWs = null) {
   });
 }
 
+function broadcastOnlineCount() {
+  broadcast({
+    type: "online_count",
+    count: connectedUsers.size,
+    timestamp: Date.now(),
+  });
+}
+
 // Запускаем сервер
 server.listen(PORT, () => {
   console.log("=".repeat(50));
   console.log(`🚀 Сервер запущен на порту: ${PORT}`);
-  console.log(`📁 Папка public: ${PUBLIC_DIR}`);
-  console.log(`📂 Файлы в public: ${fs.readdirSync(PUBLIC_DIR).join(", ")}`);
+  console.log(`💾 История загружена: ${chatHistory.length} сообщений`);
+  console.log(`💬 Максимум сообщений в истории: ${MAX_HISTORY}`);
   console.log("=".repeat(50));
 });
 
@@ -215,4 +286,16 @@ process.on("uncaughtException", (error) => {
 
 process.on("unhandledRejection", (reason, promise) => {
   console.error("🔥 Необработанный промис:", reason);
+});
+
+// Graceful shutdown
+process.on("SIGINT", () => {
+  console.log("\n🛑 Остановка сервера...");
+  saveHistory();
+  wss.close(() => {
+    server.close(() => {
+      console.log("✅ Сервер остановлен");
+      process.exit(0);
+    });
+  });
 });
