@@ -6,6 +6,13 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0, viewport-fit=cover"
     />
+    <!-- Для уведомлений на iOS -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta name="apple-mobile-web-app-title" content="Чат" />
+
+    <!-- Для уведомлений на Android -->
+    <link rel="manifest" href="/manifest.json" />
     <title>Простой чат для двоих</title>
     <link rel="stylesheet" href="style.css" />
     <link
@@ -98,7 +105,36 @@
 
     <!-- Уведомления -->
     <div id="notification" class="notification"></div>
-
+    <audio id="notification-sound" preload="auto">
+      <source src="/notification.mp3" type="audio/mpeg" />
+    </audio>
     <script src="client.js"></script>
+    <script>
+      // Регистрация Service Worker
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker
+            .register("/sw.js")
+            .then((registration) => {
+              console.log("Service Worker зарегистрирован:", registration);
+            })
+            .catch((error) => {
+              console.log("Ошибка регистрации Service Worker:", error);
+            });
+        });
+      }
+
+      // Запрос разрешения на уведомления при загрузке
+      document.addEventListener("DOMContentLoaded", function () {
+        if ("Notification" in window && Notification.permission === "default") {
+          // На iOS нужно запрашивать после жеста пользователя
+          if (!/iPad|iPhone|iPod/.test(navigator.userAgent)) {
+            setTimeout(() => {
+              Notification.requestPermission();
+            }, 2000);
+          }
+        }
+      });
+    </script>
   </body>
 </html>

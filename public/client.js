@@ -12,6 +12,9 @@ class SimpleChat {
     this.pendingMessages = new Map();
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 5;
+    this.notificationPermission = false;
+    this.isTabActive = true;
+    this.lastNotificationTime = 0;
 
     // Элементы DOM
     this.loginScreen = document.getElementById("login-screen");
@@ -46,6 +49,8 @@ class SimpleChat {
     this.setupEventListeners();
     this.loadFromStorage();
     this.checkAutoLogin();
+    this.setupNotifications();
+    this.setupTabVisibility();
   }
 
   setupEventListeners() {
@@ -84,6 +89,91 @@ class SimpleChat {
         }
       }
     });
+  }
+
+  setupNotifications() {
+    // Проверяем поддержку уведомлений
+    if (!("Notification" in window)) {
+      console.log("Браузер не поддерживает уведомления");
+      return;
+    }
+
+    // Проверяем текущий статус разрешения
+    if (Notification.permission === "granted") {
+      this.notificationPermission = true;
+      console.log("Уведомления разрешены");
+    } else if (Notification.permission !== "denied") {
+      // Запрашиваем разрешение не сразу, а через 3 секунды после входа
+      setTimeout(() => {
+        this.requestNotificationPermission();
+      }, 3000);
+    }
+  }
+
+  requestNotificationPermission() {
+    Notification.requestPermission().then((permission) => {
+      this.notificationPermission = permission === "granted";
+      if (this.notificationPermission) {
+        this.showNotification("Уведомления включены");
+        console.log("Разрешение на уведомления получено");
+      }
+    });
+  }
+
+  setupTabVisibility() {
+    // Отслеживаем активность вкладки
+    document.addEventListener("visibilitychange", () => {
+      this.isTabActive = !document.hidden;
+    });
+
+    // Также отслеживаем focus/blur окна
+    window.addEventListener("focus", () => {
+      this.isTabActive = true;
+    });
+
+    window.addEventListener("blur", () => {
+      this.isTabActive = false;
+    });
+  }
+
+  showBrowserNotification(title, body, tag = "chat-notification") {
+    // Не показываем уведомления, если вкладка активна
+    if (this.isTabActive) {
+      return;
+    }
+
+    // Не чаще чем раз в 5 секунд для одного отправителя
+    const now = Date.now();
+    if (now - this.lastNotificationTime < 5000) {
+      return;
+    }
+
+    if (!this.notificationPermission) {
+      return;
+    }
+
+    // Показываем уведомление
+    const notification = new Notification(title, {
+      body: body,
+      icon: "/favicon.ico",
+      tag: tag, // Группирует уведомления
+      requireInteraction: false,
+      silent: false,
+      vibrate: [200, 100, 200], // Вибрация на поддерживаемых устройствах
+    });
+
+    this.lastNotificationTime = now;
+
+    // При клике на уведомление активируем вкладку
+    notification.onclick = () => {
+      window.focus();
+      notification.close();
+    };
+
+    // Автоматически закрываем через 5 секунд
+    setTimeout(() => {
+      notification.close();
+    }, 5000);
   }
 
   loadFromStorage() {
@@ -285,6 +375,7 @@ class SimpleChat {
 
       case "user_joined":
         this.showNotification(`${data.username} присоединился`);
+        this.showBrowserNotification("Чат", `${data.username} присоединился`);
         this.updateOnlineCount(data.onlineCount);
         break;
 
@@ -426,6 +517,17 @@ class SimpleChat {
       pending: false,
     };
 
+    // Показываем уведомление, если сообщение не от нас и вкладка не активна
+    if (!message.isOwn) {
+      this.showBrowserNotification(
+        `Новое сообщение от ${message.username}`,
+        message.text.length > 100
+          ? message.text.substring(0, 100) + "..."
+          : message.text,
+        `message-${message.username}`
+      );
+    }
+
     this.messages.push(message);
     this.renderMessage(message);
     this.scrollToBottom();
@@ -543,6 +645,18 @@ document.addEventListener("DOMContentLoaded", () => {
   if (!window.WebSocket) {
     alert("Ваш браузер не поддерживает WebSocket. Обновите браузер.");
     return;
+  }
+
+  // Проверка на iOS Safari - запрашиваем разрешение после жеста пользователя
+  if (/iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream) {
+    // На iOS нужно, чтобы запрос разрешения был инициирован пользовательским жестом
+    const requestPermissionOnClick = () => {
+      window.chatApp.requestNotificationPermission();
+      document.removeEventListener("click", requestPermissionOnClick);
+    };
+    document.addEventListener("click", requestPermissionOnClick, {
+      once: true,
+    });
   }
 
   window.chatApp = new SimpleChat();

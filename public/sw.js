@@ -1,4 +1,4 @@
-// Service Worker для PWA
+// Service Worker для PWA и уведомлений
 const CACHE_NAME = "simple-chat-v1";
 const urlsToCache = [
   "/",
@@ -6,8 +6,6 @@ const urlsToCache = [
   "/style.css",
   "/client.js",
   "/manifest.json",
-  "/icons/icon-192.png",
-  "/icons/icon-512.png",
 ];
 
 self.addEventListener("install", (event) => {
@@ -22,6 +20,42 @@ self.addEventListener("fetch", (event) => {
       .match(event.request)
       .then((response) => response || fetch(event.request))
   );
+});
+
+self.addEventListener("push", (event) => {
+  const data = event.data.json();
+
+  const options = {
+    body: data.body || "Новое сообщение",
+    icon: "/icon-192.png",
+    badge: "/icon-192.png",
+    vibrate: [200, 100, 200],
+    data: {
+      url: data.url || "/",
+    },
+    actions: [
+      {
+        action: "open",
+        title: "Открыть чат",
+      },
+      {
+        action: "close",
+        title: "Закрыть",
+      },
+    ],
+  };
+
+  event.waitUntil(
+    self.registration.showNotification(data.title || "Чат", options)
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+
+  if (event.action === "open") {
+    event.waitUntil(clients.openWindow(event.notification.data.url));
+  }
 });
 
 self.addEventListener("activate", (event) => {
