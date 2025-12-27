@@ -553,6 +553,26 @@ class SimpleChat {
         console.log(
           `📂 Загружено ${this.unsentMessages.length} неотправленных сообщений`
         );
+
+        // Восстанавливаем неотправленные сообщения в чат
+        this.unsentMessages.forEach((item) => {
+          // Проверяем, нет ли уже такого сообщения в чате
+          const exists = this.messages.some(
+            (msg) => msg.id === item.message.id
+          );
+          if (!exists && item.localMessage) {
+            // Добавляем в чат как pending
+            item.localMessage.pending = true;
+            item.localMessage.failed = false;
+            item.localMessage.attempts = item.localMessage.attempts || 0;
+            this.messages.push(item.localMessage);
+          }
+        });
+
+        // Перерисовываем чат
+        if (this.unsentMessages.length > 0) {
+          setTimeout(() => this.renderMessages(), 100);
+        }
       }
     } catch (e) {
       console.error("❌ Ошибка загрузки неотправленных сообщений:", e);
@@ -709,17 +729,11 @@ class SimpleChat {
           this.reconnectAttempts = 0;
           this.updateConnectionStatus("В сети");
 
-          // Безопасная отправка join сообщения
-          this.safeSend({
-            type: "join",
-            username: this.username,
-            timestamp: Date.now(),
-            device: this.getDeviceInfo(),
-            sessionId: this.sessionId || this.generateSessionId(),
-          });
+          // Отправляем join сообщение
+          this.sendJoinMessage();
 
-          // Отправляем накопленные сообщения
-          this.sendPendingMessages();
+          // Пытаемся отправить все неотправленные сообщения
+          this.resendUnsentMessages();
 
           // Показываем оффлайн-сообщения
           this.showOfflineMessages();
@@ -732,7 +746,7 @@ class SimpleChat {
         } else {
           console.warn("⚠️ WebSocket не открыт после onopen");
         }
-      }, 150); // Увеличиваем задержку для надежности
+      }, 200); // Увеличиваем задержку
     };
 
     this.socket.onmessage = (event) => {
@@ -772,6 +786,61 @@ class SimpleChat {
       console.error("❌ WebSocket ошибка:", error);
       this.updateConnectionStatus("Ошибка подключения");
     };
+  }
+  sendJoinMessage() {
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      const joinMessage = {
+        type: "join",
+        username: this.username,
+        timestamp: Date.now(),
+        device: this.getDeviceInfo(),
+        sessionId: this.sessionId || this.generateSessionId(),
+      };
+
+      try {
+        this.socket.send(JSON.stringify(joinMessage));
+        console.log("👋 Отправлен join для пользователя:", this.username);
+      } catch (error) {
+        console.error("❌ Ошибка отправки join:", error);
+        // Пытаемся снова через 2 секунды
+        setTimeout(() => this.sendJoinMessage(), 2000);
+      }
+    } else {
+      console.warn("⚠️ WebSocket не готов для отправки join");
+      // Пытаемся снова через 1 секунду
+      setTimeout(() => this.sendJoinMessage(), 1000);
+    }
+  }
+  resendUnsentMessages() {
+    if (!this.unsentMessages || this.unsentMessages.length === 0) {
+      return;
+    }
+
+    console.log(
+      `📤 Пытаюсь повторно отправить ${this.unsentMessages.length} неотправленных сообщений`
+    );
+
+    // Отправляем каждое сообщение с задержкой
+    this.unsentMessages.forEach((item, index) => {
+      setTimeout(() => {
+        if (
+          this.isConnected &&
+          this.socket &&
+          this.socket.readyState === WebSocket.OPEN
+        ) {
+          // Находим соответствующее локальное сообщение
+          const localMessage = this.messages.find(
+            (msg) => msg.id === item.message.id
+          );
+          if (localMessage && localMessage.pending) {
+            // Сбрасываем счетчик попыток
+            localMessage.attempts = 0;
+            // Пытаемся отправить снова
+            this.attemptToSend(item.message, localMessage);
+          }
+        }
+      }, index * 500); // Задержка 500мс между сообщениями
+    });
   }
 
   // Безопасная отправка сообщений с очередью
@@ -1090,6 +1159,10 @@ class SimpleChat {
       messageElement.classList.add("pending");
     }
 
+    if (message.failed) {
+      messageElement.classList.add("failed");
+    }
+
     if (message.offline) {
       messageElement.classList.add("offline");
     }
@@ -1101,25 +1174,54 @@ class SimpleChat {
 
     let statusIcon = "";
     if (message.pending) {
+      statusIcon = `<span class="pending-indicator">
+      <i class="fas fa-clock"></i>
+      ${message.statusText || "Отправка..."}
+    </span>`;
+    } else if (message.failed) {
       statusIcon =
-        '<span class="pending-indicator"><i class="fas fa-clock"></i></span>';
+        '<span class="failed-indicator"><i class="fas fa-exclamation-circle"></i> Не отправлено</span>';
     } else if (message.offline) {
       statusIcon =
         '<span class="offline-indicator"><i class="fas fa-wifi-slash"></i></span>';
     }
 
     messageElement.innerHTML = `
-            <div class="message-content">
-                ${this.escapeHtml(message.text)}
-                ${statusIcon}
-            </div>
-            <div class="message-info">
-                <span class="message-sender">${
-                  message.isOwn ? "Вы" : this.escapeHtml(message.username)
-                }</span>
-                <span class="message-time">${time}</span>
-            </div>
-        `;
+    <div class="message-content">
+      ${this.escapeHtml(message.text)}
+      ${statusIcon}
+    </div>
+    <div class="message-info">
+      <span class="message-sender">${
+        message.isOwn ? "Вы" : this.escapeHtml(message.username)
+      }</span>
+      <span class="message-time">${time}</span>
+    </div>
+  `;
+
+    // Добавляем кнопку повторной отправки для неудачных сообщений
+    if (message.failed && message.isOwn) {
+      const retryButton = document.createElement("button");
+      retryButton.className = "retry-button";
+      retryButton.innerHTML = '<i class="fas fa-redo"></i>';
+      retryButton.title = "Повторить отправку";
+      retryButton.onclick = () => {
+        // Находим неотправленное сообщение
+        const unsentItem = this.unsentMessages?.find(
+          (item) => item.message.id === message.id
+        );
+        if (unsentItem) {
+          // Сбрасываем статус
+          message.failed = false;
+          message.pending = true;
+          message.attempts = 0;
+
+          // Пытаемся отправить снова
+          this.attemptToSend(unsentItem.message, message);
+        }
+      };
+      messageElement.querySelector(".message-content").appendChild(retryButton);
+    }
 
     this.messagesContainer.appendChild(messageElement);
   }
@@ -1189,57 +1291,321 @@ class SimpleChat {
       return;
     }
 
-    const localId = Date.now() + "-" + Math.random().toString(36).substr(2, 9);
+    // Создаем уникальный ID для сообщения
+    const messageId =
+      Date.now() + "-" + Math.random().toString(36).substr(2, 9);
     const timestamp = Date.now();
 
-    const message = {
+    // Сообщение для отправки на сервер
+    const messageToSend = {
       type: "message",
-      id: localId,
+      id: messageId,
       text: text,
       username: this.username,
       timestamp: timestamp,
     };
 
+    // Локальная копия для отображения
     const localMessage = {
-      localId: localId,
+      id: messageId,
+      localId: messageId,
       text: text,
       username: this.username,
       timestamp: timestamp,
       isOwn: true,
       pending: true,
+      attempts: 0, // Счетчик попыток отправки
+      maxAttempts: 3, // Максимум 3 попытки
     };
 
-    if (this.isConnected) {
-      // Если соединение есть, отправляем сразу
-      this.pendingMessages.set(localId, localId);
-      this.messages.push(localMessage);
-      this.renderMessage(localMessage);
-      this.scrollToBottom();
+    // Добавляем в локальные сообщения для отображения
+    this.messages.push(localMessage);
+    this.renderMessage(localMessage);
+    this.scrollToBottom();
 
-      this.safeSend(message);
-    } else {
-      // Если соединения нет, сохраняем для отправки позже
-      console.log("📦 Сохраняю сообщение для отправки позже");
-      this.unsentMessages.push({
-        message: message,
-        localMessage: localMessage,
-      });
+    // Сохраняем неотправленное сообщение
+    this.saveUnsentMessage(messageToSend, localMessage);
 
-      // Показываем сообщение как "ожидает отправки"
-      localMessage.pending = true;
-      localMessage.waiting = true;
-      this.messages.push(localMessage);
-      this.renderMessage(localMessage);
-      this.scrollToBottom();
+    // Пытаемся отправить
+    this.attemptToSend(messageToSend, localMessage);
 
-      // Пытаемся переподключиться
-      this.connectWebSocket();
-    }
-
+    // Очищаем поле ввода
     this.messageInput.value = "";
     this.sendBtn.disabled = true;
+
+    // Сохраняем состояние
     this.saveToStorage();
-    this.saveOfflineData();
+  }
+
+  saveUnsentMessage(messageToSend, localMessage) {
+    if (!this.unsentMessages) {
+      this.unsentMessages = [];
+    }
+
+    // Проверяем, нет ли уже такого сообщения
+    const existingIndex = this.unsentMessages.findIndex(
+      (item) => item.message.id === messageToSend.id
+    );
+
+    if (existingIndex === -1) {
+      this.unsentMessages.push({
+        message: messageToSend,
+        localMessage: localMessage,
+        timestamp: Date.now(),
+        attempts: 0,
+      });
+
+      // Сохраняем в localStorage
+      try {
+        localStorage.setItem(
+          "chat_unsent_messages",
+          JSON.stringify(this.unsentMessages)
+        );
+      } catch (e) {
+        console.error("Ошибка сохранения неотправленных сообщений:", e);
+      }
+    }
+  }
+
+  // Пытаемся отправить сообщение
+  attemptToSend(messageToSend, localMessage) {
+    if (!messageToSend || !localMessage) return;
+
+    // Увеличиваем счетчик попыток
+    if (localMessage.attempts === undefined) localMessage.attempts = 0;
+    localMessage.attempts++;
+
+    // Обновляем отображение сообщения
+    this.updateMessageStatus(localMessage.id, "attempt", localMessage.attempts);
+
+    if (
+      this.isConnected &&
+      this.socket &&
+      this.socket.readyState === WebSocket.OPEN
+    ) {
+      try {
+        console.log("📤 Отправляю сообщение:", messageToSend.id);
+
+        // Отправляем через WebSocket
+        this.socket.send(JSON.stringify(messageToSend));
+
+        // Добавляем в pendingMessages для отслеживания
+        this.pendingMessages.set(messageToSend.id, localMessage.id);
+
+        // Ставим таймер для проверки доставки
+        this.setDeliveryTimeout(messageToSend.id, localMessage);
+      } catch (error) {
+        console.error("❌ Ошибка отправки:", error);
+        this.handleSendError(messageToSend, localMessage, error);
+      }
+    } else {
+      console.log(
+        "📦 Соединение отсутствует, сообщение сохранено для отправки позже"
+      );
+
+      // Если нет соединения, пытаемся подключиться
+      if (!this.isConnected && this.isLoggedIn()) {
+        this.connectWebSocket();
+      }
+
+      // Планируем повторную попытку через 5 секунд
+      setTimeout(() => {
+        if (this.isConnected) {
+          this.attemptToSend(messageToSend, localMessage);
+        } else if (localMessage.attempts < localMessage.maxAttempts) {
+          // Планируем еще одну попытку
+          setTimeout(() => {
+            this.attemptToSend(messageToSend, localMessage);
+          }, 5000);
+        }
+      }, 5000);
+    }
+  }
+
+  // Таймер для проверки доставки
+  setDeliveryTimeout(messageId, localMessage) {
+    // Удаляем старый таймер если есть
+    if (localMessage.deliveryTimer) {
+      clearTimeout(localMessage.deliveryTimer);
+    }
+
+    // Устанавливаем новый таймер (10 секунд)
+    localMessage.deliveryTimer = setTimeout(() => {
+      if (this.messages.some((msg) => msg.id === messageId && msg.pending)) {
+        console.log("⏰ Таймаут доставки для сообщения:", messageId);
+
+        // Увеличиваем счетчик попыток
+        localMessage.attempts++;
+
+        if (localMessage.attempts >= localMessage.maxAttempts) {
+          // Превышено количество попыток
+          this.updateMessageStatus(messageId, "failed");
+          this.showNotification("Не удалось отправить сообщение");
+        } else {
+          // Пытаемся отправить снова
+          const unsentItem = this.unsentMessages.find(
+            (item) => item.message.id === messageId
+          );
+          if (unsentItem) {
+            this.attemptToSend(unsentItem.message, localMessage);
+          }
+        }
+      }
+    }, 10000); // 10 секунд
+  }
+
+  // Обработка ошибки отправки
+  handleSendError(messageToSend, localMessage, error) {
+    console.error("Ошибка отправки сообщения:", error);
+
+    if (localMessage.attempts < localMessage.maxAttempts) {
+      // Планируем повторную попытку через 3 секунды
+      setTimeout(() => {
+        this.attemptToSend(messageToSend, localMessage);
+      }, 3000);
+    } else {
+      // Превышено количество попыток
+      this.updateMessageStatus(localMessage.id, "failed");
+      this.showNotification("Не удалось отправить сообщение");
+    }
+  }
+
+  // Обновляем статус сообщения
+  updateMessageStatus(messageId, status, attempts = 0) {
+    const messageIndex = this.messages.findIndex((msg) => msg.id === messageId);
+    if (messageIndex !== -1) {
+      const message = this.messages[messageIndex];
+
+      switch (status) {
+        case "attempt":
+          message.pending = true;
+          message.statusText = `Попытка ${attempts}/${
+            message.maxAttempts || 3
+          }`;
+          break;
+        case "sent":
+          message.pending = false;
+          message.statusText = "";
+          // Удаляем таймер
+          if (message.deliveryTimer) {
+            clearTimeout(message.deliveryTimer);
+          }
+          break;
+        case "failed":
+          message.pending = false;
+          message.failed = true;
+          message.statusText = "Не отправлено";
+          break;
+      }
+
+      // Перерисовываем сообщение
+      this.renderMessages();
+    }
+  }
+
+  handleNewMessage(data) {
+    console.log("📨 Получено сообщение от сервера:", data.id);
+
+    // Проверяем, не наше ли это сообщение (подтверждение отправки)
+    const isOurMessage = data.username === this.username;
+    const pendingLocalId = this.pendingMessages.get(data.id);
+
+    if (isOurMessage && pendingLocalId) {
+      // Это подтверждение нашего сообщения
+      console.log("✅ Подтверждение доставки для сообщения:", data.id);
+
+      // Обновляем статус сообщения
+      this.updateMessageStatus(data.id, "sent");
+
+      // Удаляем из pendingMessages
+      this.pendingMessages.delete(data.id);
+
+      // Удаляем из unsentMessages
+      this.removeFromUnsent(data.id);
+
+      // Обновляем сообщение в списке
+      const messageIndex = this.messages.findIndex((msg) => msg.id === data.id);
+      if (messageIndex !== -1) {
+        this.messages[messageIndex] = {
+          ...this.messages[messageIndex],
+          id: data.id,
+          pending: false,
+          statusText: "",
+        };
+      }
+
+      this.renderMessages();
+      return;
+    }
+
+    // Это сообщение от другого пользователя
+    const message = {
+      id: data.id,
+      text: data.text,
+      username: data.username,
+      timestamp: data.timestamp || Date.now(),
+      isOwn: data.username === this.username,
+      pending: false,
+    };
+
+    // Если мы были оффлайн, сохраняем сообщение
+    if (!this.isTabActive || document.hidden) {
+      this.saveOfflineMessage(message);
+    }
+
+    // iPhone уведомление
+    if (!message.isOwn) {
+      this.showIOSNotification(
+        `💬 ${message.username}`,
+        message.text.length > 50
+          ? message.text.substring(0, 50) + "..."
+          : message.text
+      );
+    }
+
+    this.messages.push(message);
+    this.renderMessage(message);
+    this.scrollToBottom();
+  }
+
+  // Удаляем сообщение из unsentMessages
+  removeFromUnsent(messageId) {
+    if (!this.unsentMessages) return;
+
+    const index = this.unsentMessages.findIndex(
+      (item) => item.message.id === messageId
+    );
+    if (index !== -1) {
+      this.unsentMessages.splice(index, 1);
+
+      // Сохраняем обновленный список
+      try {
+        localStorage.setItem(
+          "chat_unsent_messages",
+          JSON.stringify(this.unsentMessages)
+        );
+      } catch (e) {
+        console.error("Ошибка сохранения unsentMessages:", e);
+      }
+    }
+  }
+
+  // Сохраняем оффлайн-сообщение
+  saveOfflineMessage(message) {
+    if (!this.offlineMessages) {
+      this.offlineMessages = [];
+    }
+
+    this.offlineMessages.push(message);
+
+    try {
+      localStorage.setItem(
+        "chat_offline_messages",
+        JSON.stringify(this.offlineMessages.slice(-100))
+      );
+    } catch (e) {
+      console.error("Ошибка сохранения оффлайн-сообщений:", e);
+    }
   }
 
   updateOnlineCount(count) {
