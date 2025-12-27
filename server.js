@@ -3,6 +3,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 
+const USER_RECONNECT_TIMEOUT = 5000;
 const PORT = process.env.PORT || 3000;
 const HISTORY_FILE = path.join(__dirname, "chat_history.json");
 const MAX_HISTORY = 1000; // Увеличим до 1000 сообщений
@@ -294,37 +295,64 @@ wss.on("connection", (ws) => {
       console.log(`📨 Получено сообщение типа: ${message.type}`);
 
       if (message.type === "join") {
-        // Проверяем, нет ли уже пользователя с таким именем
-        const existingUser = Array.from(connectedUsers.values()).find(
-          (user) => user.username === message.username
+        const username = message.username;
+
+        // Проверяем, есть ли уже пользователь с таким именем
+        const existingUserEntry = Array.from(connectedUsers.entries()).find(
+          ([ws, user]) => user.username === username
         );
 
-        if (existingUser) {
-          ws.send(
-            JSON.stringify({
-              type: "error",
-              message: "Пользователь с таким именем уже в чате",
-            })
-          );
-          ws.close();
-          return;
+        if (existingUserEntry) {
+          const [existingWs, existingUser] = existingUserEntry;
+
+          // Если это тот же самый сокет (переподключение) или старый сокет закрыт
+          if (existingWs === ws || existingWs.readyState !== 1) {
+            // Заменяем старый сокет на новый
+            connectedUsers.delete(existingWs);
+            connectedUsers.set(ws, { username: username });
+
+            console.log(`🔄 ${username} переподключился`);
+
+            // Не уведомляем о "новом" пользователе, только обновляем online count
+            broadcastOnlineCount();
+
+            // Отправляем историю новому соединению
+            ws.send(
+              JSON.stringify({
+                type: "history",
+                messages: chatHistory.slice(-50),
+              })
+            );
+
+            return;
+          } else {
+            // Другой пользователь пытается зайти под тем же именем
+            ws.send(
+              JSON.stringify({
+                type: "error",
+                message: "Пользователь с таким именем уже в чате",
+              })
+            );
+            ws.close();
+            return;
+          }
         }
 
         // Добавляем пользователя
         const user = { ws, username: message.username };
-        connectedUsers.set(ws, user);
+        connectedUsers.set(ws, { username: username });
 
-        console.log(`👤 ${message.username} присоединился`);
+        console.log(`👤 ${username} присоединился`);
 
         // Уведомляем всех о новом пользователе
         broadcast(
           {
             type: "user_joined",
-            username: message.username,
+            username: username,
             onlineCount: connectedUsers.size,
             timestamp: Date.now(),
           },
-          ws // ИСКЛЮЧАЕМ отправителя из этого уведомления
+          ws
         );
 
         // Отправляем обновлённое количество онлайн
@@ -430,32 +458,35 @@ wss.on("connection", (ws) => {
   });
 
   ws.on("close", () => {
-    const username = activeConnections.get(ws);
+    const user = connectedUsers.get(ws);
 
-    if (username) {
-      console.log(`🔌 ${username} разорвал соединение`);
-      activeConnections.delete(ws);
+    if (user) {
+      console.log(`🔌 ${user.username} разорвал соединение`);
 
-      // Не сразу помечаем как offline, даем время на переподключение
+      // Не удаляем сразу, даем время на переподключение
       setTimeout(() => {
-        // Если пользователь так и не переподключился за 60 секунд
-        if (!Array.from(activeConnections.values()).includes(username)) {
-          updateUserStatus(username, USER_STATUS.OFFLINE);
+        // Проверяем, не переподключился ли пользователь за это время
+        const isStillConnected = Array.from(connectedUsers.entries()).some(
+          ([existingWs, existingUser]) =>
+            existingUser.username === user.username &&
+            existingWs.readyState === 1
+        );
+
+        if (!isStillConnected) {
+          connectedUsers.delete(ws);
+          console.log(`👋 ${user.username} окончательно вышел`);
 
           broadcast({
             type: "user_left",
-            username: username,
-            onlineCount: getOnlineUsers().length,
+            username: user.username,
+            onlineCount: connectedUsers.size,
             timestamp: Date.now(),
           });
 
           broadcastOnlineCount();
         }
-      }, 60000); // Ждем 60 секунд
+      }, USER_RECONNECT_TIMEOUT);
     }
-
-    // Очищаем таймер
-    if (activityTimer) clearTimeout(activityTimer);
   });
 
   ws.on("error", (error) => {
@@ -513,6 +544,27 @@ server.on("request", (req, res) => {
     return;
   }
 });
+
+// Периодическая очистка мертвых соединений
+setInterval(() => {
+  const deadConnections = [];
+
+  connectedUsers.forEach((user, ws) => {
+    if (ws.readyState !== 1) {
+      // Не OPEN
+      deadConnections.push({ ws, user });
+    }
+  });
+
+  deadConnections.forEach(({ ws, user }) => {
+    connectedUsers.delete(ws);
+    console.log(`🧹 Очищено мертвое соединение для ${user.username}`);
+  });
+
+  if (deadConnections.length > 0) {
+    broadcastOnlineCount();
+  }
+}, 30000); // Каждые 30 секунд
 
 // Обработка ошибок
 process.on("uncaughtException", (error) => {
