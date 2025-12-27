@@ -750,12 +750,19 @@ class SimpleChat {
     };
 
     this.socket.onmessage = (event) => {
+      console.log("📨 Получено сообщение от сервера:", event.data);
       try {
         const data = JSON.parse(event.data);
+        console.log("📨 Парсинг сообщения типа:", data.type);
         this.handleWebSocketMessage(data);
         this.saveToStorage();
       } catch (error) {
-        console.error("Ошибка парсинга сообщения:", error);
+        console.error(
+          "Ошибка парсинга сообщения:",
+          error,
+          "Данные:",
+          event.data
+        );
       }
     };
 
@@ -1369,6 +1376,12 @@ class SimpleChat {
 
   // Пытаемся отправить сообщение
   attemptToSend(messageToSend, localMessage) {
+    console.log("🚀 attemptToSend вызван для:", messageToSend.id);
+    console.log("📡 Состояние WebSocket:", {
+      isConnected: this.isConnected,
+      readyState: this.socket ? this.socket.readyState : "no socket",
+      socketExists: !!this.socket,
+    });
     if (!messageToSend || !localMessage) return;
 
     // Увеличиваем счетчик попыток

@@ -132,15 +132,29 @@ function getOnlineUsers() {
 
 // Добавляем сообщение в историю
 function addToHistory(message) {
-  chatHistory.push(message);
+  // Проверяем, нет ли уже такого сообщения (по id или по содержанию)
+  const isDuplicate = chatHistory.some(
+    (msg) =>
+      msg.id === message.id ||
+      (msg.text === message.text &&
+        msg.username === message.username &&
+        Math.abs(msg.timestamp - message.timestamp) < 1000)
+  );
 
-  // Ограничиваем размер истории
-  if (chatHistory.length > MAX_HISTORY) {
-    chatHistory = chatHistory.slice(-MAX_HISTORY);
+  if (!isDuplicate) {
+    chatHistory.push(message);
+    console.log(`💾 Сохранено в историю: ${message.id}`);
+
+    // Ограничиваем размер истории
+    if (chatHistory.length > MAX_HISTORY) {
+      chatHistory = chatHistory.slice(-MAX_HISTORY);
+    }
+
+    // Сохраняем на диск каждое сообщение
+    saveHistory();
+  } else {
+    console.log(`⚠️ Пропущено дублирующее сообщение: ${message.id}`);
   }
-
-  // Сохраняем на диск каждое сообщение
-  saveHistory();
 }
 
 // Создаем HTTP сервер
@@ -222,6 +236,21 @@ loadHistory();
 wss.on("connection", (ws) => {
   console.log("🔗 Новое WebSocket подключение");
 
+  setTimeout(() => {
+    if (ws.readyState === 1) {
+      // WebSocket.OPEN
+      ws.send(
+        JSON.stringify({
+          type: "history",
+          messages: chatHistory.slice(-50), // Последние 50 сообщений
+        })
+      );
+      console.log(
+        `📜 Отправлена история (${chatHistory.slice(-50).length} сообщений)`
+      );
+    }
+  }, 500); // Небольшая задержка
+
   // Таймер для проверки активности
   let activityTimer = null;
 
@@ -258,131 +287,93 @@ wss.on("connection", (ws) => {
     })
   );
 
+  // В server.js замените весь блок ws.on("message") на этот:
   ws.on("message", (data) => {
     try {
-      const message = JSON.parse(data);
+      const message = JSON.parse(data.toString()); // Используем toString() для безопасности
+      console.log(`📨 Получено сообщение типа: ${message.type}`);
 
       if (message.type === "join") {
-        const username = message.username;
+        // Проверяем, нет ли уже пользователя с таким именем
+        const existingUser = Array.from(connectedUsers.values()).find(
+          (user) => user.username === message.username
+        );
 
-        if (pendingMessages.has(username)) {
-          const messages = pendingMessages.get(username);
-          if (messages.length > 0) {
-            console.log(
-              `📨 Отправляю ${messages.length} ожидающих сообщений для ${username}`
-            );
-
-            // Отправляем каждое сообщение
-            messages.forEach((msg) => {
-              setTimeout(() => {
-                if (ws.readyState === 1) {
-                  // WebSocket.OPEN
-                  ws.send(JSON.stringify(msg.message));
-                }
-              }, 100);
-            });
-
-            // Очищаем очередь
-            pendingMessages.delete(username);
-          }
-        }
-
-        // Проверяем, онлайн ли уже пользователь с таким именем
-        const existingUser = allUsers.get(username);
-
-        if (existingUser && existingUser.status === USER_STATUS.ONLINE) {
-          // Пользователь уже онлайн в другом окне/вкладке
+        if (existingUser) {
           ws.send(
             JSON.stringify({
               type: "error",
-              message: "Вы уже вошли в чат с другого устройства или вкладки",
+              message: "Пользователь с таким именем уже в чате",
             })
           );
           ws.close();
           return;
         }
 
-        // Регистрируем пользователя
-        updateUserStatus(username, USER_STATUS.ONLINE);
-        activeConnections.set(ws, username);
+        // Добавляем пользователя
+        const user = { ws, username: message.username };
+        connectedUsers.set(ws, user);
 
-        console.log(`👤 ${username} присоединился`);
+        console.log(`👤 ${message.username} присоединился`);
 
         // Уведомляем всех о новом пользователе
         broadcast(
           {
             type: "user_joined",
-            username: username,
-            onlineCount: getOnlineUsers().length,
+            username: message.username,
+            onlineCount: connectedUsers.size,
             timestamp: Date.now(),
           },
-          ws
+          ws // ИСКЛЮЧАЕМ отправителя из этого уведомления
         );
 
         // Отправляем обновлённое количество онлайн
         broadcastOnlineCount();
-
-        // Сбрасываем таймер активности
-        resetActivityTimer();
       }
 
       if (message.type === "message") {
         const user = connectedUsers.get(ws);
-        if (!user) return;
+        if (!user) {
+          console.log("❌ Сообщение от неавторизованного пользователя");
+          ws.send(
+            JSON.stringify({
+              type: "error",
+              message: "Сначала войдите в чат",
+            })
+          );
+          return;
+        }
 
-        // Создаём сообщение с уникальным ID
+        // Используем ID от клиента или создаем новый
         const chatMessage = {
           id:
             message.id ||
-            Date.now() + "-" + Math.random().toString(36).substr(2, 9),
+            `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
           type: "message",
-          text: message.text.substring(0, 500),
+          text: (message.text || "").substring(0, 500),
           username: user.username,
           timestamp: message.timestamp || Date.now(),
         };
-        allUsers.forEach((user, userUsername) => {
-          if (user.status === "offline" && userUsername !== username) {
-            if (!pendingMessages.has(userUsername)) {
-              pendingMessages.set(userUsername, []);
-            }
-
-            const queue = pendingMessages.get(userUsername);
-            queue.push({
-              message: chatMessage,
-              timestamp: Date.now(),
-            });
-
-            // Ограничиваем очередь 50 сообщениями
-            if (queue.length > 50) {
-              queue.shift();
-            }
-          }
-        });
-
-        // Сохраняем сообщение для оффлайн-пользователей
-        wss.clients.forEach((client) => {
-          if (client !== ws && client.readyState === 1) {
-            // Пользователь онлайн - отправляем сразу
-            client.send(JSON.stringify(chatMessage));
-          }
-        });
 
         console.log(
-          `💬 ${user.username}: ${chatMessage.text.substring(0, 50)}${
+          `💬 ${user.username} отправил: "${chatMessage.text.substring(0, 50)}${
             chatMessage.text.length > 50 ? "..." : ""
-          }`
+          }"`
         );
 
         // Сохраняем в историю
         addToHistory(chatMessage);
 
-        // Отправляем всем
+        // ОТПРАВЛЯЕМ ВСЕМ ВКЛЮЧАЯ ОТПРАВИТЕЛЯ (для подтверждения)
         broadcast(chatMessage);
+
+        console.log(`✅ Сообщение ${chatMessage.id} сохранено и отправлено`);
       }
 
       if (message.type === "clear_chat") {
         const user = connectedUsers.get(ws);
         if (user && connectedUsers.size <= 2) {
+          // Только если мало пользователей
           chatHistory = [];
           saveHistory();
 
@@ -395,13 +386,11 @@ wss.on("connection", (ws) => {
           });
         }
       }
-      if (message.type === "heartbeat") {
-        const username = activeConnections.get(ws);
-        if (username) {
-          // Обновляем время последней активности
-          resetActivityTimer();
 
-          // Отправляем подтверждение клиенту
+      // Обработка heartbeat
+      if (message.type === "heartbeat") {
+        const user = connectedUsers.get(ws);
+        if (user) {
           ws.send(
             JSON.stringify({
               type: "heartbeat_ack",
@@ -410,8 +399,33 @@ wss.on("connection", (ws) => {
           );
         }
       }
+
+      // Обработка user_status
+      if (message.type === "user_status") {
+        const user = connectedUsers.get(ws);
+        if (user) {
+          broadcast({
+            type: "user_status",
+            username: user.username,
+            status: message.status,
+            timestamp: message.timestamp,
+          });
+        }
+      }
     } catch (error) {
-      console.error("❌ Ошибка обработки сообщения:", error);
+      console.error("❌ Ошибка обработки сообщения:", error, "Данные:", data);
+
+      // Отправляем клиенту сообщение об ошибке
+      try {
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            message: "Ошибка обработки сообщения",
+          })
+        );
+      } catch (e) {
+        console.error("Не удалось отправить ошибку клиенту:", e);
+      }
     }
   });
 
@@ -451,13 +465,21 @@ wss.on("connection", (ws) => {
 
 function broadcast(message, excludeWs = null) {
   const data = JSON.stringify(message);
+  let sentCount = 0;
 
   wss.clients.forEach((client) => {
-    if (client.readyState === 1 && client !== excludeWs) {
+    if (client.readyState === 1) {
       // 1 = OPEN
-      client.send(data);
+      try {
+        client.send(data);
+        sentCount++;
+      } catch (error) {
+        console.error("❌ Ошибка отправки сообщения клиенту:", error);
+      }
     }
   });
+
+  console.log(`📤 Сообщение ${message.type} отправлено ${sentCount} клиентам`);
 }
 
 function broadcastOnlineCount() {
