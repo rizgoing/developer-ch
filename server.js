@@ -27,6 +27,8 @@ const activeConnections = new Map(); // Ключ: WebSocket, Значение: �
 let chatHistory = [];
 let connectedUsers = new Map();
 
+const pendingMessages = new Map(); // username -> [{message, timestamp}]
+
 setInterval(() => {
   const now = Date.now();
   userSessions.forEach((session, sessionId) => {
@@ -263,6 +265,28 @@ wss.on("connection", (ws) => {
       if (message.type === "join") {
         const username = message.username;
 
+        if (pendingMessages.has(username)) {
+          const messages = pendingMessages.get(username);
+          if (messages.length > 0) {
+            console.log(
+              `📨 Отправляю ${messages.length} ожидающих сообщений для ${username}`
+            );
+
+            // Отправляем каждое сообщение
+            messages.forEach((msg) => {
+              setTimeout(() => {
+                if (ws.readyState === 1) {
+                  // WebSocket.OPEN
+                  ws.send(JSON.stringify(msg.message));
+                }
+              }, 100);
+            });
+
+            // Очищаем очередь
+            pendingMessages.delete(username);
+          }
+        }
+
         // Проверяем, онлайн ли уже пользователь с таким именем
         const existingUser = allUsers.get(username);
 
@@ -316,6 +340,32 @@ wss.on("connection", (ws) => {
           username: user.username,
           timestamp: message.timestamp || Date.now(),
         };
+        allUsers.forEach((user, userUsername) => {
+          if (user.status === "offline" && userUsername !== username) {
+            if (!pendingMessages.has(userUsername)) {
+              pendingMessages.set(userUsername, []);
+            }
+
+            const queue = pendingMessages.get(userUsername);
+            queue.push({
+              message: chatMessage,
+              timestamp: Date.now(),
+            });
+
+            // Ограничиваем очередь 50 сообщениями
+            if (queue.length > 50) {
+              queue.shift();
+            }
+          }
+        });
+
+        // Сохраняем сообщение для оффлайн-пользователей
+        wss.clients.forEach((client) => {
+          if (client !== ws && client.readyState === 1) {
+            // Пользователь онлайн - отправляем сразу
+            client.send(JSON.stringify(chatMessage));
+          }
+        });
 
         console.log(
           `💬 ${user.username}: ${chatMessage.text.substring(0, 50)}${

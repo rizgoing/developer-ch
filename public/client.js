@@ -41,6 +41,12 @@ class SimpleChat {
     this.reconnectTimeout = null;
     this.isBackground = false;
 
+    this.serviceWorkerRegistration = null;
+    this.backgroundSyncSupported = false;
+
+    this.offlineMessages = [];
+    this.unsentMessages = [];
+
     // Для хранения списка пользователей
     this.onlineUsers = new Map(); // username -> {status, lastSeen}
 
@@ -70,6 +76,8 @@ class SimpleChat {
     this.setupIOSFeatures();
     this.setupActivityTracking(); // НОВАЯ ФУНКЦИЯ
     this.setupVisibilityHandlers(); // НОВАЯ ФУНКЦИЯ
+    this.setupServiceWorker(); // НОВАЯ ФУНКЦИЯ
+    this.loadOfflineData();
   }
 
   setupEventListeners() {
@@ -325,22 +333,26 @@ class SimpleChat {
   showIOSNotification(title, body) {
     if (!this.isIOS) return;
 
-    // 1. Обновляем заголовок вкладки с количеством непрочитанных
+    // 1. Обновляем заголовок вкладки
     this.unreadCount++;
     this.updateTabTitle();
 
-    // 2. Вибрация (если поддерживается)
+    // 2. Вибрация
     if (navigator.vibrate) {
       navigator.vibrate([200, 100, 200]);
     }
 
-    // 3. Звуковое уведомление (если не в беззвучном режиме)
+    // 3. Звуковое уведомление
     if (!this.isTabActive) {
       this.playNotificationSound();
     }
 
-    // 4. Показываем браузерное уведомление (если разрешено и не в PWA режиме)
-    if (
+    // 4. Показываем уведомление через Service Worker (если есть)
+    if (this.serviceWorkerRegistration) {
+      this.showServiceWorkerNotification(title, body);
+    }
+    // 5. Или через обычное API уведомлений
+    else if (
       "Notification" in window &&
       Notification.permission === "granted" &&
       !this.isPWA
@@ -348,7 +360,7 @@ class SimpleChat {
       this.showBrowserNotification(title, body);
     }
 
-    // 5. Для PWA режима обновляем бейдж иконки
+    // 6. Бейдж для PWA
     if (this.isPWA && navigator.setAppBadge) {
       navigator.setAppBadge(this.unreadCount).catch(console.error);
     }
@@ -380,6 +392,95 @@ class SimpleChat {
         console.log("Не удалось воспроизвести звук:", e.message);
       });
     }
+  }
+  showServiceWorkerNotification(title, body) {
+    if (
+      this.serviceWorkerRegistration &&
+      this.notificationPermission === "granted"
+    ) {
+      // Отправляем данные в Service Worker
+      navigator.serviceWorker.controller.postMessage({
+        type: "SHOW_NOTIFICATION",
+        notification: {
+          title: title,
+          body: body,
+          icon: "/icon-192.png",
+          timestamp: Date.now(),
+        },
+      });
+
+      // Или используем showNotification напрямую
+      this.serviceWorkerRegistration
+        .showNotification(title, {
+          body: body,
+          icon: "/icon-192.png",
+          badge: "/icon-72.png",
+          vibrate: [200, 100, 200],
+          tag: "chat-message",
+          renotify: true,
+          data: {
+            url: window.location.href,
+            timestamp: Date.now(),
+          },
+        })
+        .catch((error) => {
+          console.log("⚠️ Не удалось показать уведомление:", error);
+          // Fallback к обычным уведомлениям
+          this.showBrowserNotification(title, body);
+        });
+    }
+  }
+
+  // Фоновая синхронизация
+  setupBackgroundSync() {
+    if (this.backgroundSyncSupported && this.serviceWorkerRegistration) {
+      // Регистрируем фоновую синхронизацию при разрыве соединения
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden && !this.isConnected && this.isLoggedIn()) {
+          this.registerBackgroundSync();
+        }
+      });
+    }
+  }
+
+  registerBackgroundSync() {
+    if (this.serviceWorkerRegistration && this.serviceWorkerRegistration.sync) {
+      this.serviceWorkerRegistration.sync
+        .register("check-messages")
+        .then(() => {
+          console.log("🔄 Фоновая синхронизация зарегистрирована");
+        })
+        .catch((err) => {
+          console.log("❌ Ошибка регистрации фоновой синхронизации:", err);
+        });
+    }
+  }
+
+  // Модифицируем метод onAppBackground:
+  onAppBackground() {
+    this.isBackground = true;
+    console.log("📱 Приложение ушло в фон");
+
+    // Регистрируем фоновую синхронизацию
+    if (this.backgroundSyncSupported) {
+      this.registerBackgroundSync();
+    }
+
+    // Heartbeat реже в фоне
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = setInterval(() => {
+        if (this.isConnected && this.isLoggedIn()) {
+          this.sendHeartbeat();
+        } else {
+          // Пытаемся переподключиться в фоне
+          this.connectWebSocket();
+        }
+      }, 60000); // Каждую минуту в фоне
+    }
+
+    // Сохраняем непрочитанные сообщения
+    this.savePendingMessages();
   }
 
   showBrowserNotification(title, body) {
@@ -543,6 +644,12 @@ class SimpleChat {
           })
         );
 
+        // Отправляем накопленные сообщения
+        this.sendPendingMessages();
+
+        // Показываем оффлайн-сообщения
+        this.showOfflineMessages();
+
         if (this.messages.length > 0) {
           this.renderMessages();
         }
@@ -587,6 +694,51 @@ class SimpleChat {
     } catch (error) {
       console.error("Ошибка подключения:", error);
       this.showNotification("Ошибка подключения к серверу");
+    }
+  }
+  sendPendingMessages() {
+    if (this.unsentMessages.length > 0 && this.isConnected) {
+      console.log(
+        `📤 Отправляю ${this.unsentMessages.length} ожидающих сообщений`
+      );
+
+      this.unsentMessages.forEach((item) => {
+        this.pendingMessages.set(item.message.id, item.localId);
+        this.socket.send(JSON.stringify(item.message));
+      });
+
+      this.unsentMessages = [];
+      this.saveOfflineData();
+    }
+  }
+
+  showOfflineMessages() {
+    if (this.offlineMessages.length > 0) {
+      console.log(
+        `📨 Показываю ${this.offlineMessages.length} оффлайн-сообщений`
+      );
+
+      // Сортируем по времени
+      this.offlineMessages.sort((a, b) => a.timestamp - b.timestamp);
+
+      // Добавляем в чат
+      this.offlineMessages.forEach((msg) => {
+        if (!this.messages.some((m) => m.id === msg.id)) {
+          this.messages.push({
+            ...msg,
+            isOwn: msg.username === this.username,
+            pending: false,
+            offline: true,
+          });
+        }
+      });
+
+      // Очищаем оффлайн-сообщения
+      this.offlineMessages = [];
+      this.saveOfflineData();
+
+      // Перерисовываем чат
+      this.renderMessages();
     }
   }
 
@@ -782,6 +934,7 @@ class SimpleChat {
     const pendingLocalId = this.pendingMessages.get(data.id);
 
     if (pendingLocalId) {
+      // Это наше сообщение подтвердилось
       const pendingIndex = this.messages.findIndex(
         (msg) => msg.localId === pendingLocalId
       );
@@ -791,6 +944,7 @@ class SimpleChat {
           ...this.messages[pendingIndex],
           id: data.id,
           pending: false,
+          waiting: false,
         };
 
         this.pendingMessages.delete(data.id);
@@ -808,7 +962,13 @@ class SimpleChat {
       pending: false,
     };
 
-    // iPhone уведомление для новых сообщений не от нас
+    // Если мы были оффлайн, сохраняем сообщение
+    if (!this.isTabActive || document.hidden) {
+      this.offlineMessages.push(message);
+      this.saveOfflineData();
+    }
+
+    // iPhone уведомление
     if (!message.isOwn) {
       this.showIOSNotification(
         `💬 ${message.username}`,
@@ -826,7 +986,7 @@ class SimpleChat {
   sendMessage() {
     const text = this.messageInput.value.trim();
 
-    if (!text || !this.isConnected) {
+    if (!text) {
       return;
     }
 
@@ -850,16 +1010,36 @@ class SimpleChat {
       pending: true,
     };
 
-    this.pendingMessages.set(localId, localId);
-    this.messages.push(localMessage);
-    this.renderMessage(localMessage);
-    this.scrollToBottom();
+    if (this.isConnected) {
+      // Если соединение есть, отправляем сразу
+      this.pendingMessages.set(localId, localId);
+      this.messages.push(localMessage);
+      this.renderMessage(localMessage);
+      this.scrollToBottom();
 
-    this.socket.send(JSON.stringify(message));
+      this.socket.send(JSON.stringify(message));
+    } else {
+      // Если соединения нет, сохраняем для отправки позже
+      console.log("📦 Сохраняю сообщение для отправки позже");
+      this.unsentMessages.push({
+        message: message,
+        localMessage: localMessage,
+      });
+
+      // Показываем сообщение как "ожидает отправки"
+      localMessage.pending = true;
+      localMessage.waiting = true;
+      this.messages.push(localMessage);
+      this.renderMessage(localMessage);
+      this.scrollToBottom();
+
+      // Пытаемся переподключиться
+      this.connectWebSocket();
+    }
 
     this.messageInput.value = "";
     this.sendBtn.disabled = true;
-    this.saveToStorage();
+    this.saveOfflineData(); // Сохраняем данные
   }
 
   updateOnlineCount(count) {
@@ -953,6 +1133,119 @@ class SimpleChat {
             this.showBackgroundNotification(messages);
           }
         });
+    }
+  }
+
+  setupServiceWorker() {
+    if ("serviceWorker" in navigator) {
+      console.log("🛠️ Регистрирую Service Worker...");
+
+      navigator.serviceWorker
+        .register("/sw.js")
+        .then((registration) => {
+          this.serviceWorkerRegistration = registration;
+          console.log("✅ Service Worker зарегистрирован");
+
+          // Проверяем поддержку фоновой синхронизации
+          if ("sync" in registration) {
+            this.backgroundSyncSupported = true;
+            console.log("✅ Фоновая синхронизация поддерживается");
+          }
+
+          // Проверяем состояние Service Worker
+          if (registration.active) {
+            console.log("✅ Service Worker активен");
+          }
+
+          if (registration.waiting) {
+            console.log("⚠️ Service Worker ожидает активации");
+            this.updateServiceWorker();
+          }
+
+          if (registration.installing) {
+            console.log("🔄 Service Worker устанавливается");
+          }
+
+          // Слушаем обновления Service Worker
+          registration.addEventListener("updatefound", () => {
+            console.log("🔄 Найдено обновление Service Worker");
+          });
+        })
+        .catch((error) => {
+          console.error("❌ Ошибка регистрации Service Worker:", error);
+        });
+
+      // Слушаем сообщения от Service Worker
+      navigator.serviceWorker.addEventListener("message", (event) => {
+        console.log("📨 Сообщение от Service Worker:", event.data);
+
+        if (event.data.type === "NEW_MESSAGE") {
+          this.showBackgroundNotification(event.data.message);
+        }
+      });
+    }
+  }
+
+  updateServiceWorker() {
+    if (
+      this.serviceWorkerRegistration &&
+      this.serviceWorkerRegistration.waiting
+    ) {
+      // Сообщаем Service Worker, чтобы он обновился
+      this.serviceWorkerRegistration.waiting.postMessage({
+        type: "SKIP_WAITING",
+      });
+
+      // Перезагружаем страницу после обновления
+      window.location.reload();
+    }
+  }
+  loadOfflineData() {
+    // Загружаем непрочитанные сообщения
+    try {
+      const saved = localStorage.getItem("chat_offline_messages");
+      if (saved) {
+        this.offlineMessages = JSON.parse(saved);
+        console.log(
+          `📂 Загружено ${this.offlineMessages.length} оффлайн-сообщений`
+        );
+      }
+    } catch (e) {
+      console.error("❌ Ошибка загрузки оффлайн-сообщений:", e);
+    }
+
+    // Загружаем неотправленные сообщения
+    try {
+      const saved = localStorage.getItem("chat_unsent_messages");
+      if (saved) {
+        this.unsentMessages = JSON.parse(saved);
+        console.log(
+          `📂 Загружено ${this.unsentMessages.length} неотправленных сообщений`
+        );
+      }
+    } catch (e) {
+      console.error("❌ Ошибка загрузки неотправленных сообщений:", e);
+    }
+  }
+  saveOfflineData() {
+    // Сохраняем оффлайн-сообщения
+    try {
+      localStorage.setItem(
+        "chat_offline_messages",
+        JSON.stringify(this.offlineMessages.slice(-100))
+      ); // Последние 100
+    } catch (e) {
+      console.error("❌ Ошибка сохранения оффлайн-сообщений:", e);
+    }
+
+    // Сохраняем неотправленные сообщения
+    try {
+      localStorage.setItem(
+        "chat_unsent_messages",
+        JSON.stringify(this.unsentMessages)
+      );
+    } catch (e) {
+      console.error("❌ Ошибка сохранения неотправленных сообщений:", e);
     }
   }
 }
