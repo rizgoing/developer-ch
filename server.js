@@ -6,10 +6,27 @@ const path = require("path");
 const PORT = process.env.PORT || 3000;
 const HISTORY_FILE = path.join(__dirname, "chat_history.json");
 const MAX_HISTORY = 1000; // Увеличим до 1000 сообщений
-
+const userSessions = new Map();
+const MESSAGE_TYPES = {
+  PRESENCE_UPDATE: "presence_update",
+  TYPING_START: "typing_start",
+  TYPING_END: "typing_end",
+  READ_RECEIPT: "read_receipt",
+};
 // Хранилище данных
 let chatHistory = [];
 let connectedUsers = new Map();
+
+setInterval(() => {
+  const now = Date.now();
+  userSessions.forEach((session, sessionId) => {
+    if (now - session.lastActivity > 60000) {
+      // 60 секунд без активности
+      session.status = "away";
+      broadcastPresenceUpdate(session.username, "away");
+    }
+  });
+}, 30000);
 
 // Загружаем историю из файла
 function loadHistory() {
@@ -277,6 +294,21 @@ server.listen(PORT, () => {
   console.log(`💾 История загружена: ${chatHistory.length} сообщений`);
   console.log(`💬 Максимум сообщений в истории: ${MAX_HISTORY}`);
   console.log("=".repeat(50));
+});
+
+server.on("request", (req, res) => {
+  if (req.method === "GET" && req.url.startsWith("/api/last-messages")) {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const since = parseInt(url.searchParams.get("since")) || 0;
+
+    const recentMessages = chatHistory
+      .filter((msg) => msg.timestamp > since)
+      .slice(-10);
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(recentMessages));
+    return;
+  }
 });
 
 // Обработка ошибок

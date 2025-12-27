@@ -701,6 +701,33 @@ class SimpleChat {
     div.textContent = text;
     return div.innerHTML;
   }
+
+  setupServiceWorker() {
+    if ("serviceWorker" in navigator && "SyncManager" in window) {
+      navigator.serviceWorker.register("/sw.js").then((registration) => {
+        this.syncRegistration = registration;
+
+        // Периодическая синхронизация в фоне (только для установленных PWA)
+        if (this.isPWA) {
+          setInterval(() => this.syncInBackground(), 300000); // Каждые 5 минут
+        }
+      });
+    }
+  }
+
+  syncInBackground() {
+    if (!this.isConnected && this.isLoggedIn()) {
+      // Пытаемся получить новые сообщения через HTTP
+      fetch("/api/last-messages?since=" + this.getLastMessageTime())
+        .then((response) => response.json())
+        .then((messages) => {
+          if (messages.length > 0) {
+            // Показываем уведомление даже в фоне
+            this.showBackgroundNotification(messages);
+          }
+        });
+    }
+  }
 }
 
 // Инициализация

@@ -58,6 +58,12 @@ self.addEventListener("notificationclick", (event) => {
   }
 });
 
+self.addEventListener("sync", (event) => {
+  if (event.tag === "sync-messages") {
+    event.waitUntil(syncMessages());
+  }
+});
+
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches.keys().then((cacheNames) => {
