@@ -79,6 +79,27 @@ class SimpleChat {
     this.setupServiceWorker(); // НОВАЯ ФУНКЦИЯ
     this.loadOfflineData();
   }
+  setupBackgroundFetch() {
+    if ("backgroundFetch" in self.registration) {
+      // Регистрируем фоновую задачу
+      navigator.serviceWorker.ready.then((registration) => {
+        registration.backgroundFetch
+          .fetch("check-chat", ["/api/check"], {
+            title: "Проверка чата",
+            icons: [
+              { src: "/icon-192.png", sizes: "192x192", type: "image/png" },
+            ],
+            downloadTotal: 1024, // 1KB лимит
+          })
+          .then((backgroundFetch) => {
+            console.log("✅ Background Fetch зарегистрирован");
+          })
+          .catch((error) => {
+            console.log("❌ Background Fetch не поддерживается:", error);
+          });
+      });
+    }
+  }
 
   setupEventListeners() {
     // Вход

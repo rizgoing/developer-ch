@@ -29,6 +29,18 @@ self.addEventListener("install", (event) => {
       })
   );
 });
+self.addEventListener("backgroundfetchsuccess", (event) => {
+  console.log("✅ Background Fetch успешен");
+
+  // Показываем уведомление о новых сообщениях
+  event.waitUntil(
+    self.registration.showNotification("💬 Чат", {
+      body: "Получены новые сообщения",
+      icon: "/icon-192.png",
+      tag: "background-fetch",
+    })
+  );
+});
 
 // Активация Service Worker
 self.addEventListener("activate", (event) => {
