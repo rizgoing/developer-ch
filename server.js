@@ -13,6 +13,16 @@ const MESSAGE_TYPES = {
   TYPING_END: "typing_end",
   READ_RECEIPT: "read_receipt",
 };
+const USER_STATUS = {
+  ONLINE: "online", // Активно в чате
+  AWAY: "away", // Неактивен 30+ секунд
+  OFFLINE: "offline", // Не в сети
+};
+// Хранилище всех пользователей (даже если соединение разорвано)
+const allUsers = new Map(); // Ключ: имя пользователя, Значение: {статус, последняя активность}
+
+// Активные WebSocket соединения
+const activeConnections = new Map(); // Ключ: WebSocket, Значение: имя пользователя
 // Хранилище данных
 let chatHistory = [];
 let connectedUsers = new Map();
@@ -54,6 +64,68 @@ function saveHistory() {
   } catch (error) {
     console.error("❌ Ошибка сохранения истории:", error.message);
   }
+}
+
+// ДОБАВЬ ЭТО ПОСЛЕ ФУНКЦИЙ loadHistory() и saveHistory()
+
+// Функция для обновления статуса пользователя
+function updateUserStatus(username, status) {
+  if (!allUsers.has(username)) {
+    // Если пользователь новый, создаем запись
+    allUsers.set(username, {
+      username: username,
+      status: status,
+      lastSeen: Date.now(),
+      joinedAt: Date.now(),
+    });
+  } else {
+    // Если пользователь уже есть, обновляем статус
+    const user = allUsers.get(username);
+    user.status = status;
+    user.lastSeen = Date.now();
+    allUsers.set(username, user);
+  }
+
+  console.log(`👤 ${username} → ${status}`);
+
+  // Отправляем всем обновление статуса
+  broadcastUserStatus(username, status);
+}
+
+// Функция для отправки обновления статуса всем в чате
+function broadcastUserStatus(username, status) {
+  const user = allUsers.get(username);
+  if (!user) return;
+
+  const message = {
+    type: "user_status",
+    username: username,
+    status: status,
+    lastSeen: user.lastSeen,
+    timestamp: Date.now(),
+  };
+
+  broadcast(message);
+}
+
+// Функция для получения списка онлайн-пользователей
+function getOnlineUsers() {
+  const online = [];
+
+  allUsers.forEach((user, username) => {
+    if (
+      user.status === USER_STATUS.ONLINE ||
+      user.status === USER_STATUS.AWAY
+    ) {
+      online.push({
+        username: username,
+        status: user.status,
+        lastSeen: user.lastSeen,
+      });
+    }
+  });
+
+  return online;
 }
 
 // Добавляем сообщение в историю
@@ -148,6 +220,25 @@ loadHistory();
 wss.on("connection", (ws) => {
   console.log("🔗 Новое WebSocket подключение");
 
+  // Таймер для проверки активности
+  let activityTimer = null;
+
+  // Функция для сброса таймера активности
+  function resetActivityTimer() {
+    if (activityTimer) clearTimeout(activityTimer);
+
+    // Если пользователь не активен 30 секунд, меняем статус на "away"
+    activityTimer = setTimeout(() => {
+      const username = activeConnections.get(ws);
+      if (username) {
+        updateUserStatus(username, USER_STATUS.AWAY);
+      }
+    }, 30000); // 30 секунд
+  }
+
+  // Сбрасываем таймер при любом сообщении от клиента
+  ws.on("message", () => resetActivityTimer());
+
   // Сразу отправляем историю чата новому пользователю
   ws.send(
     JSON.stringify({
@@ -156,39 +247,49 @@ wss.on("connection", (ws) => {
     })
   );
 
+  // Отправляем список текущих пользователей
+  ws.send(
+    JSON.stringify({
+      type: "users_list",
+      users: getOnlineUsers(),
+      timestamp: Date.now(),
+    })
+  );
+
   ws.on("message", (data) => {
     try {
       const message = JSON.parse(data);
 
       if (message.type === "join") {
-        // Проверяем, нет ли уже пользователя с таким именем
-        const existingUser = Array.from(connectedUsers.values()).find(
-          (user) => user.username === message.username
-        );
+        const username = message.username;
 
-        if (existingUser) {
+        // Проверяем, онлайн ли уже пользователь с таким именем
+        const existingUser = allUsers.get(username);
+
+        if (existingUser && existingUser.status === USER_STATUS.ONLINE) {
+          // Пользователь уже онлайн в другом окне/вкладке
           ws.send(
             JSON.stringify({
               type: "error",
-              message: "Пользователь с таким именем уже в чате",
+              message: "Вы уже вошли в чат с другого устройства или вкладки",
             })
           );
           ws.close();
           return;
         }
 
-        // Добавляем пользователя
-        const user = { ws, username: message.username };
-        connectedUsers.set(ws, user);
+        // Регистрируем пользователя
+        updateUserStatus(username, USER_STATUS.ONLINE);
+        activeConnections.set(ws, username);
 
-        console.log(`👤 ${message.username} присоединился`);
+        console.log(`👤 ${username} присоединился`);
 
         // Уведомляем всех о новом пользователе
         broadcast(
           {
             type: "user_joined",
-            username: message.username,
-            onlineCount: connectedUsers.size,
+            username: username,
+            onlineCount: getOnlineUsers().length,
             timestamp: Date.now(),
           },
           ws
@@ -196,6 +297,9 @@ wss.on("connection", (ws) => {
 
         // Отправляем обновлённое количество онлайн
         broadcastOnlineCount();
+
+        // Сбрасываем таймер активности
+        resetActivityTimer();
       }
 
       if (message.type === "message") {
@@ -241,26 +345,53 @@ wss.on("connection", (ws) => {
           });
         }
       }
+      if (message.type === "heartbeat") {
+        const username = activeConnections.get(ws);
+        if (username) {
+          // Обновляем время последней активности
+          resetActivityTimer();
+
+          // Отправляем подтверждение клиенту
+          ws.send(
+            JSON.stringify({
+              type: "heartbeat_ack",
+              timestamp: Date.now(),
+            })
+          );
+        }
+      }
     } catch (error) {
       console.error("❌ Ошибка обработки сообщения:", error);
     }
   });
 
   ws.on("close", () => {
-    const user = connectedUsers.get(ws);
-    if (user) {
-      console.log(`👋 ${user.username} отключился`);
-      connectedUsers.delete(ws);
+    const username = activeConnections.get(ws);
 
-      broadcast({
-        type: "user_left",
-        username: user.username,
-        onlineCount: connectedUsers.size,
-        timestamp: Date.now(),
-      });
+    if (username) {
+      console.log(`🔌 ${username} разорвал соединение`);
+      activeConnections.delete(ws);
 
-      broadcastOnlineCount();
+      // Не сразу помечаем как offline, даем время на переподключение
+      setTimeout(() => {
+        // Если пользователь так и не переподключился за 60 секунд
+        if (!Array.from(activeConnections.values()).includes(username)) {
+          updateUserStatus(username, USER_STATUS.OFFLINE);
+
+          broadcast({
+            type: "user_left",
+            username: username,
+            onlineCount: getOnlineUsers().length,
+            timestamp: Date.now(),
+          });
+
+          broadcastOnlineCount();
+        }
+      }, 60000); // Ждем 60 секунд
     }
+
+    // Очищаем таймер
+    if (activityTimer) clearTimeout(activityTimer);
   });
 
   ws.on("error", (error) => {
@@ -282,7 +413,7 @@ function broadcast(message, excludeWs = null) {
 function broadcastOnlineCount() {
   broadcast({
     type: "online_count",
-    count: connectedUsers.size,
+    count: getOnlineUsers().length,
     timestamp: Date.now(),
   });
 }

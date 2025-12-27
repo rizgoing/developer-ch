@@ -78,6 +78,18 @@
               Участников: <span id="online-count">1</span>
             </p>
           </div>
+          <!-- В блоке #chat-screen, после счетчика онлайн -->
+          <div class="status-indicator">
+            <span>Ваш статус: </span>
+            <span id="user-status" class="status-online">В сети</span>
+          </div>
+
+          <div class="users-container">
+            <h3>Сейчас в чате (<span id="online-count">1</span>):</h3>
+            <div id="users-list" class="users-list">
+              <!-- Сюда будут добавляться пользователи -->
+            </div>
+          </div>
           <button id="clear-btn" class="icon-btn">
             <i class="fas fa-trash-alt"></i>
           </button>
@@ -103,6 +115,7 @@
             placeholder="Введите сообщение..."
             maxlength="500"
             autocomplete="off"
+            autofocus
           />
           <button id="send-btn" class="send-btn" disabled>
             <i class="fas fa-paper-plane"></i>

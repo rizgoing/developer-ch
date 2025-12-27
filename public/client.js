@@ -35,6 +35,19 @@ class SimpleChat {
     this.connectionStatus = document.getElementById("connection-status");
     this.emptyState = document.getElementById("empty-state");
 
+    this.userStatus = "offline"; // 'online', 'away', 'offline'
+    this.lastActivity = Date.now();
+    this.heartbeatInterval = null;
+    this.reconnectTimeout = null;
+    this.isBackground = false;
+
+    // Для хранения списка пользователей
+    this.onlineUsers = new Map(); // username -> {status, lastSeen}
+
+    // Элементы DOM для статусов
+    this.usersList = document.getElementById("users-list");
+    this.userStatusIndicator = document.getElementById("user-status");
+
     this.init();
   }
 
@@ -55,6 +68,8 @@ class SimpleChat {
     this.loadFromStorage();
     this.checkAutoLogin();
     this.setupIOSFeatures();
+    this.setupActivityTracking(); // НОВАЯ ФУНКЦИЯ
+    this.setupVisibilityHandlers(); // НОВАЯ ФУНКЦИЯ
   }
 
   setupEventListeners() {
@@ -116,6 +131,62 @@ class SimpleChat {
     this.setupIOSNotificationPermission();
   }
 
+  setupActivityTracking() {
+    // Отслеживаем активность пользователя
+    const updateActivity = () => {
+      this.lastActivity = Date.now();
+
+      // Если мы away, возвращаемся в online
+      if (this.userStatus === "away" && this.isConnected) {
+        this.updateUserStatus("online");
+      }
+    };
+
+    // Слушаем события активности
+    document.addEventListener("mousemove", updateActivity);
+    document.addEventListener("keydown", updateActivity);
+    document.addEventListener("click", updateActivity);
+    document.addEventListener("touchstart", updateActivity);
+
+    // Heartbeat каждые 20 секунд
+    this.heartbeatInterval = setInterval(() => {
+      if (this.isConnected && this.isLoggedIn()) {
+        this.sendHeartbeat();
+      }
+    }, 20000);
+
+    // Проверяем активность каждую минуту
+    setInterval(() => {
+      if (this.isLoggedIn() && !this.isBackground) {
+        const inactiveTime = Date.now() - this.lastActivity;
+
+        if (inactiveTime > 30000 && this.userStatus === "online") {
+          this.updateUserStatus("away");
+        }
+      }
+    }, 60000);
+  }
+  setupVisibilityHandlers() {
+    // Следим за видимостью страницы
+    document.addEventListener("visibilitychange", () => {
+      this.isBackground = document.hidden;
+
+      if (this.isBackground) {
+        // Приложение свернуто
+        console.log("📱 Приложение ушло в фон");
+        this.onAppBackground();
+      } else {
+        // Приложение снова активно
+        console.log("📱 Приложение на переднем плане");
+        this.onAppForeground();
+      }
+    });
+
+    // Слушаем события страницы
+    window.addEventListener("pagehide", () => this.onAppBackground());
+    window.addEventListener("pageshow", () => this.onAppForeground());
+  }
+
   setupNotificationSound() {
     // Создаем звуковой элемент для уведомлений
     this.notificationSound = new Audio();
@@ -157,6 +228,97 @@ class SimpleChat {
     } else {
       this.isTabActive = false;
     }
+  }
+  onAppBackground() {
+    this.isBackground = true;
+
+    // При сворачивании не разрываем соединение сразу
+    // Вместо этого уменьшаем частоту heartbeat
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = setInterval(() => {
+        if (this.isConnected && this.isLoggedIn()) {
+          this.sendHeartbeat();
+        }
+      }, 60000); // Каждую минуту в фоне
+    }
+
+    // Показываем уведомление о переходе в фон
+    if (this.isLoggedIn()) {
+      this.updateUserStatus("away");
+    }
+  }
+
+  onAppForeground() {
+    this.isBackground = false;
+
+    // Восстанавливаем обычную частоту heartbeat
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = setInterval(() => {
+        if (this.isConnected && this.isLoggedIn()) {
+          this.sendHeartbeat();
+        }
+      }, 20000); // Каждые 20 секунд на переднем плане
+    }
+
+    // Обновляем активность
+    this.lastActivity = Date.now();
+
+    if (this.isLoggedIn()) {
+      this.updateUserStatus("online");
+
+      // Если соединение потеряно, пытаемся переподключиться
+      if (!this.isConnected) {
+        this.connectWebSocket();
+      }
+    }
+  }
+  sendHeartbeat() {
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      this.socket.send(
+        JSON.stringify({
+          type: "heartbeat",
+          timestamp: Date.now(),
+          username: this.username,
+        })
+      );
+    }
+  }
+
+  updateUserStatus(status) {
+    if (this.userStatus !== status && this.username) {
+      this.userStatus = status;
+
+      // Обновляем индикатор в интерфейсе
+      if (this.userStatusIndicator) {
+        this.userStatusIndicator.textContent = this.getStatusText(status);
+        this.userStatusIndicator.className = `status-${status}`;
+      }
+
+      // Отправляем на сервер
+      if (this.isConnected) {
+        this.socket.send(
+          JSON.stringify({
+            type: "user_status",
+            status: status,
+            username: this.username,
+            timestamp: Date.now(),
+          })
+        );
+      }
+
+      console.log(`🔄 Статус изменен: ${status}`);
+    }
+  }
+
+  getStatusText(status) {
+    const statusTexts = {
+      online: "В сети",
+      away: "Отошел",
+      offline: "Не в сети",
+    };
+    return statusTexts[status] || status;
   }
 
   // iPhone-специфичные уведомления
@@ -460,6 +622,14 @@ class SimpleChat {
         this.showNotification("Чат очищен");
         break;
 
+      case "user_status":
+        this.handleUserStatus(data);
+        break;
+
+      case "users_list":
+        this.handleUsersList(data);
+        break;
+
       case "error":
         this.showNotification(`Ошибка: ${data.message}`);
         if (data.message.includes("уже в чате")) {
@@ -467,6 +637,63 @@ class SimpleChat {
         }
         break;
     }
+  }
+  handleUserStatus(data) {
+    // Обновляем статус пользователя
+    if (data.username === this.username) {
+      this.userStatus = data.status;
+    }
+
+    // Обновляем в списке пользователей
+    if (this.onlineUsers.has(data.username)) {
+      const user = this.onlineUsers.get(data.username);
+      user.status = data.status;
+      user.lastSeen = data.lastSeen;
+      this.onlineUsers.set(data.username, user);
+    }
+
+    // Обновляем интерфейс
+    this.updateUsersList();
+  }
+
+  handleUsersList(data) {
+    // Очищаем текущий список
+    this.onlineUsers.clear();
+
+    // Заполняем новыми данными
+    data.users.forEach((user) => {
+      this.onlineUsers.set(user.username, {
+        status: user.status,
+        lastSeen: user.lastSeen,
+      });
+    });
+
+    // Обновляем интерфейс
+    this.updateUsersList();
+  }
+
+  updateUsersList() {
+    if (!this.usersList) return;
+
+    this.usersList.innerHTML = "";
+
+    this.onlineUsers.forEach((user, username) => {
+      const userElement = document.createElement("div");
+      userElement.className = `user-item status-${user.status}`;
+
+      const time = new Date(user.lastSeen).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+
+      userElement.innerHTML = `
+      <span class="user-name">${this.escapeHtml(username)}</span>
+      <span class="user-status">${this.getStatusText(user.status)}</span>
+      <span class="user-last-seen">${time}</span>
+    `;
+
+      this.usersList.appendChild(userElement);
+    });
   }
 
   mergeMessagesWithHistory(serverMessages) {
